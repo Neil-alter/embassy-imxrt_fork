@@ -1136,9 +1136,16 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     .aberrclr()
                     .set_bit()
             });
-        }
 
-        waker.wake();
+            waker.wake();
+        }
+        let fifostat = regs.fifointstat().read();
+        if fifostat.txlvl().bit_is_set() || fifostat.txerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.txlvl().set_bit().txerr().set_bit());
+        }
+        if fifostat.rxlvl().bit_is_set() || fifostat.rxerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.rxlvl().set_bit().rxerr().set_bit());
+        }
     }
 }
 
