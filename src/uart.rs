@@ -329,6 +329,8 @@ impl<'a, M: Mode> Uart<'a, M> {
             regs.cfg().modify(|_, w| w.ctsen().enabled());
         }
 
+        regs.intenset().modify(|_, w| w.starten().set_bit());
+
         Self::set_baudrate_inner::<T>(config.baudrate, config.clock)?;
         Self::set_uart_config::<T>(config);
 
@@ -1112,6 +1114,49 @@ pub struct InterruptHandler<T: Instance> {
 const UART_COUNT: usize = 8;
 static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; UART_COUNT];
 
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+
+// Use Channel instead of Signal to queue START bit detections
+// This prevents race conditions where START bit interrupt occurs before wait() is called
+static RX_WAKE_CHANNEL_0: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_1: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_2: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_3: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_4: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_5: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_6: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_7: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+
+fn get_rx_wake_channel(uart_index: usize) -> Option<&'static Channel<CriticalSectionRawMutex, (), 1>> {
+    match uart_index {
+        0 => Some(&RX_WAKE_CHANNEL_0),
+        1 => Some(&RX_WAKE_CHANNEL_1),
+        2 => Some(&RX_WAKE_CHANNEL_2),
+        3 => Some(&RX_WAKE_CHANNEL_3),
+        4 => Some(&RX_WAKE_CHANNEL_4),
+        5 => Some(&RX_WAKE_CHANNEL_5),
+        6 => Some(&RX_WAKE_CHANNEL_6),
+        7 => Some(&RX_WAKE_CHANNEL_7),
+        _ => None,
+    }
+}
+
+pub fn uart_start_bit_detected(uart_index: usize) {
+    if let Some(channel) = get_rx_wake_channel(uart_index) {
+        // try_send won't block in ISR context
+        let _ = channel.try_send(());
+    }
+}
+
+pub async fn uart_wait_for_start_bit(uart_index: usize) {
+    if let Some(channel) = get_rx_wake_channel(uart_index) {
+        // receive() will wait until a START bit is detected
+        let _ = channel.receive().await;
+    }
+}
+
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let waker = &UART_WAKERS[T::index()];
@@ -1136,9 +1181,23 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     .aberrclr()
                     .set_bit()
             });
+
+            waker.wake();
+        }
+        // waker.wake();
+        let fifostat = regs.fifointstat().read();
+        if fifostat.txlvl().bit_is_set() || fifostat.txerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.txlvl().set_bit().txerr().set_bit());
+        }
+        if fifostat.rxlvl().bit_is_set() || fifostat.rxerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.rxlvl().set_bit().rxerr().set_bit());
         }
 
-        waker.wake();
+        if regs.stat().read().start().bit_is_set() {
+            regs.stat().write(|w| w.start().clear_bit_by_one());
+            // Block lower power mode
+            uart_start_bit_detected(T::index());
+        }
     }
 }
 
