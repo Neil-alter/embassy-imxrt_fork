@@ -1116,20 +1116,20 @@ static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; U
 
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::channel::Channel as SyncChannel;
 
-// Use Channel instead of Signal to queue START bit detections
+// Use SyncChannel instead of Signal to queue START bit detections
 // This prevents race conditions where START bit interrupt occurs before wait() is called
-static RX_WAKE_CHANNEL_0: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_1: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_2: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_3: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_4: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_5: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_6: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
-static RX_WAKE_CHANNEL_7: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static RX_WAKE_CHANNEL_0: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_1: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_2: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_3: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_4: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_5: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_6: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_WAKE_CHANNEL_7: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
 
-fn get_rx_wake_channel(uart_index: usize) -> Option<&'static Channel<CriticalSectionRawMutex, (), 1>> {
+fn get_rx_wake_channel(uart_index: usize) -> Option<&'static SyncChannel<CriticalSectionRawMutex, (), 1>> {
     match uart_index {
         0 => Some(&RX_WAKE_CHANNEL_0),
         1 => Some(&RX_WAKE_CHANNEL_1),
@@ -1198,6 +1198,17 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             // Block lower power mode
             uart_start_bit_detected(T::index());
         }
+
+        /*let stat = regs.stat().read();
+        if stat.start().bit_is_set() {
+            // Clear the start bit flag
+            regs.stat().write(|w| w.start().clear_bit_by_one());
+            // Block lower power mode
+            send_wake_signal();
+            // Start timer to check RX busy status
+            UART_ACTIVE[T::index()].store(true, Ordering::Relaxed);
+            // PREV_WRITE_INDEX[T::index()].store(0, Ordering::Relaxed);
+        }*/
     }
 }
 
