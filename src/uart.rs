@@ -1114,47 +1114,18 @@ pub struct InterruptHandler<T: Instance> {
 const UART_COUNT: usize = 8;
 static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; UART_COUNT];
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel as SyncChannel;
+use embassy_sync::signal::Signal;
 
-// Use SyncChannel instead of Signal to queue START bit detections
-// This prevents race conditions where START bit interrupt occurs before wait() is called
-static RX_WAKE_CHANNEL_0: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_1: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_2: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_3: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_4: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_5: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_6: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-static RX_WAKE_CHANNEL_7: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
-
-fn get_rx_wake_channel(uart_index: usize) -> Option<&'static SyncChannel<CriticalSectionRawMutex, (), 1>> {
-    match uart_index {
-        0 => Some(&RX_WAKE_CHANNEL_0),
-        1 => Some(&RX_WAKE_CHANNEL_1),
-        2 => Some(&RX_WAKE_CHANNEL_2),
-        3 => Some(&RX_WAKE_CHANNEL_3),
-        4 => Some(&RX_WAKE_CHANNEL_4),
-        5 => Some(&RX_WAKE_CHANNEL_5),
-        6 => Some(&RX_WAKE_CHANNEL_6),
-        7 => Some(&RX_WAKE_CHANNEL_7),
-        _ => None,
-    }
-}
+// Signal array for START bit detection per UART
+static RX_WAKE_SIGNAL: [Signal<CriticalSectionRawMutex, ()>; UART_COUNT] = [const { Signal::new() }; UART_COUNT];
 
 pub fn uart_start_bit_detected(uart_index: usize) {
-    if let Some(channel) = get_rx_wake_channel(uart_index) {
-        // try_send won't block in ISR context
-        let _ = channel.try_send(());
-    }
+    RX_WAKE_SIGNAL[uart_index].signal(());
 }
 
 pub async fn uart_wait_for_start_bit(uart_index: usize) {
-    if let Some(channel) = get_rx_wake_channel(uart_index) {
-        // receive() will wait until a START bit is detected
-        let _ = channel.receive().await;
-    }
+    RX_WAKE_SIGNAL[uart_index].wait().await;
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
