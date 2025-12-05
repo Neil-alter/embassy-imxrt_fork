@@ -329,6 +329,8 @@ impl<'a, M: Mode> Uart<'a, M> {
             regs.cfg().modify(|_, w| w.ctsen().enabled());
         }
 
+        regs.intenset().modify(|_, w| w.starten().set_bit());
+
         Self::set_baudrate_inner::<T>(config.baudrate, config.clock)?;
         Self::set_uart_config::<T>(config);
 
@@ -1112,6 +1114,25 @@ pub struct InterruptHandler<T: Instance> {
 const UART_COUNT: usize = 8;
 static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; UART_COUNT];
 
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel as SyncChannel;
+
+// Use SyncChannel instead of Signal to queue START bit detections
+// This prevents race conditions where START bit interrupt occurs before wait() is called
+static RX_WAKE_CHANNEL: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_SLEEP_CHANNEL: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+
+#[allow(dead_code)]
+pub fn uart_start_bit_detected() {
+    let _ = RX_WAKE_CHANNEL.try_send(());
+}
+
+#[allow(dead_code)]
+pub async fn uart_wait_for_start_bit() {
+    let _ = RX_WAKE_CHANNEL.receive().await;
+}
+
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let waker = &UART_WAKERS[T::index()];
@@ -1136,9 +1157,23 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     .aberrclr()
                     .set_bit()
             });
+
+            waker.wake();
+        }
+        // waker.wake();
+        let fifostat = regs.fifointstat().read();
+        if fifostat.txlvl().bit_is_set() || fifostat.txerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.txlvl().set_bit().txerr().set_bit());
+        }
+        if fifostat.rxlvl().bit_is_set() || fifostat.rxerr().bit_is_set() {
+            regs.fifointenclr().write(|w| w.rxlvl().set_bit().rxerr().set_bit());
         }
 
-        waker.wake();
+        if regs.stat().read().start().bit_is_set() {
+            regs.stat().write(|w| w.start().clear_bit_by_one());
+            // The first time detetct, block lower power mode
+            uart_start_bit_detected();
+        }
     }
 }
 
