@@ -1114,18 +1114,23 @@ pub struct InterruptHandler<T: Instance> {
 const UART_COUNT: usize = 8;
 static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; UART_COUNT];
 
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
+use embassy_sync::channel::Channel as SyncChannel;
 
-// Signal array for START bit detection per UART
-static RX_WAKE_SIGNAL: [Signal<CriticalSectionRawMutex, ()>; UART_COUNT] = [const { Signal::new() }; UART_COUNT];
+// Use SyncChannel instead of Signal to queue START bit detections
+// This prevents race conditions where START bit interrupt occurs before wait() is called
+static RX_WAKE_CHANNEL: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
+static RX_SLEEP_CHANNEL: SyncChannel<CriticalSectionRawMutex, (), 1> = SyncChannel::new();
 
-pub fn uart_start_bit_detected(uart_index: usize) {
-    RX_WAKE_SIGNAL[uart_index].signal(());
+#[allow(dead_code)]
+pub fn uart_start_bit_detected() {
+    let _ = RX_WAKE_CHANNEL.try_send(());
 }
 
-pub async fn uart_wait_for_start_bit(uart_index: usize) {
-    RX_WAKE_SIGNAL[uart_index].wait().await;
+#[allow(dead_code)]
+pub async fn uart_wait_for_start_bit() {
+    let _ = RX_WAKE_CHANNEL.receive().await;
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
@@ -1166,20 +1171,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 
         if regs.stat().read().start().bit_is_set() {
             regs.stat().write(|w| w.start().clear_bit_by_one());
-            // Block lower power mode
-            uart_start_bit_detected(T::index());
+            // The first time detetct, block lower power mode
+            uart_start_bit_detected();
         }
-
-        /*let stat = regs.stat().read();
-        if stat.start().bit_is_set() {
-            // Clear the start bit flag
-            regs.stat().write(|w| w.start().clear_bit_by_one());
-            // Block lower power mode
-            send_wake_signal();
-            // Start timer to check RX busy status
-            UART_ACTIVE[T::index()].store(true, Ordering::Relaxed);
-            // PREV_WRITE_INDEX[T::index()].store(0, Ordering::Relaxed);
-        }*/
     }
 }
 
