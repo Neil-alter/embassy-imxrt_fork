@@ -12,7 +12,7 @@ use crate::clocks::{SysconPeripheral, enable_and_reset};
 use crate::interrupt::typelevel::Interrupt;
 use crate::{Peri, PeripheralType, interrupt, peripherals};
 
-static RNG_WAKER: AtomicWaker = AtomicWaker::new();
+static RNG_WAKER: AtomicWaker = AtomicWaker::new();aaa
 
 // The values are based on the NIST SP 800-90B recommendations for entropy source testing
 //   with α = 2 ^(-20), H = 0.8 (NXP recommendation, though questionable), W = 512 samples
