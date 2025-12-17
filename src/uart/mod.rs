@@ -5,13 +5,14 @@ use core::marker::PhantomData;
 use core::task::Poll;
 
 use embassy_futures::select::{Either, select};
+use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
 use paste::paste;
 
 use crate::dma::channel::Channel;
-use crate::dma::transfer::Transfer;
+use crate::dma::transfer::{self, Transfer};
 use crate::flexcomm::{Clock, FlexcommRef};
 use crate::gpio::{AnyPin, GpioPin as Pin};
 use crate::interrupt::typelevel::Interrupt;
@@ -19,6 +20,10 @@ use crate::iopctl::{DriveMode, DriveStrength, Inverter, IopctlPin, Pull, SlewRat
 use crate::pac::usart0::cfg::{Clkpol, Datalen, Loop, Paritysel as Parity, Stoplen, Syncen, Syncmst};
 use crate::pac::usart0::ctl::Cc;
 use crate::{dma, interrupt};
+
+mod buffered;
+use buffered::BufferedUartState;
+pub use buffered::{BufferedInterruptHandler, BufferedUart, BufferedUartRx};
 
 /// Driver move trait.
 #[allow(private_bounds)]
@@ -220,17 +225,6 @@ impl<'a> UartTx<'a, Blocking> {
     }
 }
 
-struct BufferConfig {
-    #[cfg(feature = "time")]
-    buffer: &'static mut [u8],
-    #[cfg(feature = "time")]
-    write_index: usize,
-    #[cfg(feature = "time")]
-    read_index: usize,
-    #[cfg(feature = "time")]
-    polling_rate: u64,
-}
-
 impl<'a, M: Mode> UartRx<'a, M> {
     fn new_inner<T: Instance>(
         _flexcomm: FlexcommRef,
@@ -245,6 +239,17 @@ impl<'a, M: Mode> UartRx<'a, M> {
             _phantom: PhantomData,
         }
     }
+}
+
+struct BufferConfig {
+    #[cfg(feature = "time")]
+    buffer: &'static mut [u8],
+    #[cfg(feature = "time")]
+    write_index: usize,
+    #[cfg(feature = "time")]
+    read_index: usize,
+    #[cfg(feature = "time")]
+    polling_rate: u64,
 }
 
 impl<'a> UartRx<'a, Blocking> {
@@ -741,8 +746,8 @@ impl<'a> UartRx<'a, Async> {
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
-                is_continuous: true,
-                is_sw_trig: true,
+                mode: transfer::Mode::Continuous,
+                trigger: transfer::Trigger::Software,
             },
         );
         rx_dma.enable_channel();
@@ -762,22 +767,6 @@ impl<'a> UartRx<'a, Async> {
 
     /// Read from UART RX asynchronously.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<()> {
-        #[cfg(feature = "time")]
-        {
-            if self._buffer_config.is_some() {
-                self.read_buffered(buf).await
-            } else {
-                self.read_unbuffered(buf).await
-            }
-        }
-
-        #[cfg(not(feature = "time"))]
-        {
-            self.read_unbuffered(buf).await
-        }
-    }
-
-    async fn read_unbuffered(&mut self, buf: &mut [u8]) -> Result<()> {
         let regs = self.info.regs;
 
         for chunk in buf.chunks_mut(1024) {
@@ -848,7 +837,6 @@ impl<'a> UartRx<'a, Async> {
         Ok(())
     }
 
-    #[cfg(feature = "time")]
     async fn read_buffered(&mut self, buf: &mut [u8]) -> Result<()> {
         // unwrap safe here as only entry path to API requires rx_dma instance
         let rx_dma = self._rx_dma.as_ref().unwrap();
@@ -1039,7 +1027,6 @@ impl<'a> Uart<'a, Async> {
     }
 
     /// Create a new DMA enabled UART with Rx buffering enabled
-    #[cfg(feature = "time")]
     pub fn new_async_with_buffer<T: Instance>(
         _inner: Peri<'a, T>,
         tx: Peri<'a, impl TxPin<T>>,
@@ -1061,6 +1048,9 @@ impl<'a> Uart<'a, Async> {
         let tx = tx.into();
         let rx = rx.into();
 
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma: Channel<'_> = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
 
@@ -1075,8 +1065,8 @@ impl<'a> Uart<'a, Async> {
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
-                is_continuous: true,
-                is_sw_trig: true,
+                mode: transfer::Mode::Continuous,
+                trigger: transfer::Trigger::Software,
             },
         );
         rx_dma.enable_channel();
@@ -1139,7 +1129,6 @@ impl<'a> Uart<'a, Async> {
     }
 
     /// Create a new DMA enabled UART with hardware flow control (RTS/CTS) and Rx buffering enabled
-    #[cfg(feature = "time")]
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rtscts_buffer<T: Instance>(
         _inner: Peri<'a, T>,
@@ -1188,8 +1177,8 @@ impl<'a> Uart<'a, Async> {
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
-                is_continuous: true,
-                is_sw_trig: true,
+                mode: transfer::Mode::Continuous,
+                trigger: transfer::Trigger::Software,
             },
         );
         rx_dma.enable_channel();
@@ -1482,6 +1471,7 @@ unsafe impl Send for Info {}
 trait SealedInstance {
     fn info() -> Info;
     fn waker() -> &'static AtomicWaker;
+    fn buffered_state() -> &'static BufferedUartState; // Temporarily disabled
 }
 
 /// UART interrupt handler.
@@ -1546,6 +1536,13 @@ macro_rules! impl_instance {
                     fn waker() -> &'static AtomicWaker {
                         static WAKER: AtomicWaker = AtomicWaker::new();
                         &WAKER
+                    }
+
+                    fn buffered_state() -> &'static BufferedUartState {
+                        static STATE: BufferedUartState = BufferedUartState {
+                            ring_buf: RingBuffer::new(),
+                        };
+                        &STATE
                     }
                 }
 
@@ -1699,3 +1696,35 @@ impl_dma!(FLEXCOMM6, Tx, DMA0_CH13);
 
 impl_dma!(FLEXCOMM7, Rx, DMA0_CH14);
 impl_dma!(FLEXCOMM7, Tx, DMA0_CH15);
+
+pub async fn monitor_dma_uart_combined(dma_channel: usize, interval_ms: u64) {
+    let dma0 = unsafe { crate::pac::Dma0::steal() };
+    let usart1 = unsafe { &*crate::pac::Usart1::ptr() };
+
+    info!(
+        "[Debug UART Monitor] Starting DMA Channel {} + USART1 RX monitoring",
+        dma_channel
+    );
+
+    loop {
+        let is_busy = (dma0.busy0().read().bsy().bits() & (1 << dma_channel)) != 0;
+        let is_active = (dma0.active0().read().act().bits() & (1 << dma_channel)) != 0;
+        let is_enabled = (dma0.enableset0().read().ena().bits() & (1 << dma_channel)) != 0;
+        let xfercount = dma0.channel(dma_channel).xfercfg().read().xfercount().bits();
+
+        let uart_fifostat = usart1.fifostat().read();
+        let dmarx = usart1.fifocfg().read().dmarx().bit();
+        let rxfull = uart_fifostat.rxfull().bit();
+        let rxlvl = uart_fifostat.rxlvl().bits();
+        let rxerr = uart_fifostat.rxerr().bit();
+        let rxnoempty = uart_fifostat.rxnotempty().bit();
+        let rxidle = usart1.stat().read().rxidle().bit();
+
+        info!(
+            "[Debug UART Monitor] DMA CH {}: Busy: {}, Active: {}, Enabled: {}, XferCount: {} | USART1 RX: DMARX: {}, RXFULL: {}, RXLVL: {}, RXERR: {}, NotEmpty: {}, IDLE: {}",
+            dma_channel, is_busy, is_active, is_enabled, xfercount, dmarx, rxfull, rxlvl, rxerr, rxnoempty, rxidle
+        );
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(interval_ms)).await;
+    }
+}
