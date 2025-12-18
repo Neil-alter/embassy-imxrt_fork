@@ -361,6 +361,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-bus",
+ "embedded-io-async",
  "embedded-mcu-hal",
  "embedded-storage",
  "embedded-storage-async",

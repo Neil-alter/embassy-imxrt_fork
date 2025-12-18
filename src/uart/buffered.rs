@@ -1,42 +1,532 @@
-use crate::dma::channel::Channel;
-use core::future::poll_fn;
-use core::marker::PhantomData;
-use core::task::Poll;
-use embassy_futures::select::{Either, select};
-use embassy_hal_internal::Peri;
+//! Buffered UART driver.
+use core::future::Future;
+use core::slice;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
+use embassy_hal_internal::interrupt::InterruptExt;
 
-use super::{Async, Config, CtsPin, Error, Info, Instance, Result, RtsPin, RxDma, RxPin, TxDma, TxPin, Uart, UartTx};
-use crate::dma::transfer;
-use crate::interrupt::typelevel::Interrupt;
-use crate::{dma, interrupt};
+use super::*;
 
-struct BufferConfig {
-    dma_buf: &'static mut [u8],
-    dma_last_write_index: usize,
-    polling_rate: u64,
+/// Buffered UART state
+pub struct State {
+    tx_waker: AtomicWaker,
+    tx_buf: RingBuffer,
+    rx_waker: AtomicWaker,
+    rx_buf: RingBuffer,
+    rx_error: AtomicU32,
 }
 
-pub(super) struct BufferedUartState {
-    pub(super) ring_buf: RingBuffer,
-}
+// these must match bits in STAT register.
+const RXE_NOISE: u32 = 1 << 15;
+const RXE_PARITYERR: u32 = 1 << 14;
+const RXE_FRAMERR: u32 = 1 << 13;
+const RXE_BREAK: u32 = 1 << 10;
 
-pub(super) fn init_buffers(state: &BufferedUartState, ring_buffer: Option<&'static mut [u8]>) {
-    if let Some(ring_buffer) = ring_buffer {
-        let len = ring_buffer.len();
-        unsafe { state.ring_buf.init(ring_buffer.as_mut_ptr(), len) };
+impl State {
+    /// Create a new state instance
+    pub const fn new() -> Self {
+        Self {
+            rx_buf: RingBuffer::new(),
+            tx_buf: RingBuffer::new(),
+            rx_waker: AtomicWaker::new(),
+            tx_waker: AtomicWaker::new(),
+            rx_error: AtomicU32::new(0),
+        }
     }
 }
 
+/// Buffered UART driver.
+pub struct BufferedUart {
+    pub(super) rx: BufferedUartRx,
+    pub(super) tx: BufferedUartTx,
+}
+
+/// Buffered UART RX handle.
+pub struct BufferedUartRx {
+    pub(super) info: &'static Info,
+    pub(super) state: &'static State,
+    _flexcomm: FlexcommRef,
+}
+
+/// Buffered UART TX handle.
+pub struct BufferedUartTx {
+    pub(super) info: &'static Info,
+    pub(super) state: &'static State,
+    _flexcomm: FlexcommRef,
+}
+
+pub(super) fn init_buffers<'d>(
+    info: &Info,
+    state: &State,
+    tx_buffer: Option<&'d mut [u8]>,
+    rx_buffer: Option<&'d mut [u8]>,
+) {
+    if let Some(tx_buffer) = tx_buffer {
+        let len = tx_buffer.len();
+        unsafe { state.tx_buf.init(tx_buffer.as_mut_ptr(), len) };
+    }
+
+    if let Some(rx_buffer) = rx_buffer {
+        let len = rx_buffer.len();
+        unsafe { state.rx_buf.init(rx_buffer.as_mut_ptr(), len) };
+    }
+
+    // From the datasheet:
+    // "The transmit interrupt is based on a transition through a level, rather
+    // than on the level itself. When the interrupt and the UART is enabled
+    // before any data is written to the transmit FIFO the interrupt is not set.
+    // The interrupt is only set, after written data leaves the single location
+    // of the transmit FIFO and it becomes empty."
+    //
+    // This means we can leave the interrupt enabled the whole time as long as
+    // we clear it after it happens. The downside is that the we manually have
+    // to pend the ISR when we want data transmission to start.
+    info.regs().intenset().write(|w| {
+        w.framerren()
+            .set_bit()
+            .parityerren()
+            .set_bit()
+            .rxnoiseen()
+            .set_bit()
+            .aberren()
+            .set_bit()
+    });
+
+    info.regs()
+        .fifointenset()
+        .write(|w| w.rxlvl().set_bit().txlvl().set_bit());
+
+    info.regs()
+        .fifotrig()
+        .write(|w| w.rxlvlena().set_bit().txlvlena().set_bit());
+
+    info.interrupt.unpend();
+    unsafe { info.interrupt.enable() };
+}
+
+impl BufferedUart {
+    /// Create a buffered UART instance.
+    pub fn new<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        tx: Peri<'d, impl TxPin<T>>,
+        rx: Peri<'d, impl RxPin<T>>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        tx_buffer: &'d mut [u8],
+        rx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        tx.as_tx();
+        rx.as_rx();
+
+        let flexcomm = super::Uart::<Async>::init::<T>(Some(tx.into()), Some(rx.into()), None, None, config)?;
+        init_buffers(T::info(), T::buffered_state(), Some(tx_buffer), Some(rx_buffer));
+
+        Ok(Self {
+            rx: BufferedUartRx {
+                info: T::info(),
+                state: T::buffered_state(),
+                _flexcomm: flexcomm.clone(),
+            },
+            tx: BufferedUartTx {
+                info: T::info(),
+                state: T::buffered_state(),
+                _flexcomm: flexcomm,
+            },
+        })
+    }
+
+    /// Create a buffered UART instance with flow control.
+    pub fn new_with_rtscts<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        tx: Peri<'d, impl TxPin<T>>,
+        rx: Peri<'d, impl RxPin<T>>,
+        rts: Peri<'d, impl RtsPin<T>>,
+        cts: Peri<'d, impl CtsPin<T>>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        tx_buffer: &'d mut [u8],
+        rx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        tx.as_tx();
+        rx.as_rx();
+        rts.as_rts();
+        cts.as_cts();
+
+        let flexcomm = super::Uart::<Async>::init::<T>(
+            Some(tx.into()),
+            Some(rx.into()),
+            Some(rts.into()),
+            Some(cts.into()),
+            config,
+        )?;
+        init_buffers(T::info(), T::buffered_state(), Some(tx_buffer), Some(rx_buffer));
+
+        Ok(Self {
+            rx: BufferedUartRx {
+                info: T::info(),
+                state: T::buffered_state(),
+                _flexcomm: flexcomm.clone(),
+            },
+            tx: BufferedUartTx {
+                info: T::info(),
+                state: T::buffered_state(),
+                _flexcomm: flexcomm,
+            },
+        })
+    }
+
+    /// Write to UART TX buffer blocking execution until done.
+    pub fn blocking_write(&mut self, buffer: &[u8]) -> Result<usize> {
+        self.tx.blocking_write(buffer)
+    }
+
+    /// Flush UART TX blocking execution until done.
+    pub fn blocking_flush(&mut self) -> Result<()> {
+        self.tx.blocking_flush()
+    }
+
+    /// Read from UART RX buffer blocking execution until done.
+    pub fn blocking_read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        self.rx.blocking_read(buffer)
+    }
+
+    /// Check if UART is busy transmitting.
+    pub fn busy(&self) -> bool {
+        self.tx.busy()
+    }
+
+    /// Split into separate RX and TX handles.
+    pub fn split(self) -> (BufferedUartTx, BufferedUartRx) {
+        (self.tx, self.rx)
+    }
+
+    /// Split the Uart into a transmitter and receiver by mutable reference,
+    /// which is particularly useful when having two tasks correlating to
+    /// transmitting and receiving.
+    pub fn split_ref(&mut self) -> (&mut BufferedUartTx, &mut BufferedUartRx) {
+        (&mut self.tx, &mut self.rx)
+    }
+}
+
+impl BufferedUartRx {
+    /// Create a new buffered UART RX.
+    pub fn new<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        rx: Peri<'d, impl RxPin<T>>,
+        rx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        rx.as_rx();
+
+        let _flexcomm = super::Uart::<Async>::init::<T>(None, Some(rx.into().reborrow()), None, None, config)?;
+        init_buffers(T::info(), T::buffered_state(), None, Some(rx_buffer));
+
+        Ok(Self {
+            info: T::info(),
+            state: T::buffered_state(),
+            _flexcomm,
+        })
+    }
+
+    /// Create a new buffered UART RX with flow control.
+    pub fn new_with_rts<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        rx: Peri<'d, impl RxPin<T>>,
+        rts: Peri<'d, impl RtsPin<T>>,
+        rx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        rx.as_rx();
+        rts.as_rts();
+
+        let _flexcomm =
+            super::Uart::<Async>::init::<T>(None, Some(rx.into().reborrow()), Some(rts.into()), None, config)?;
+        init_buffers(T::info(), T::buffered_state(), None, Some(rx_buffer));
+
+        Ok(Self {
+            info: T::info(),
+            state: T::buffered_state(),
+            _flexcomm,
+        })
+    }
+
+    fn read<'a>(
+        info: &'static Info,
+        state: &'static State,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize>> + 'a {
+        poll_fn(move |cx| {
+            if let Poll::Ready(r) = Self::try_read(info, state, buf) {
+                return Poll::Ready(r);
+            }
+            state.rx_waker.register(cx.waker());
+            Poll::Pending
+        })
+    }
+
+    fn get_rx_error(state: &State) -> Option<Error> {
+        let errs = critical_section::with(|_| {
+            let val = state.rx_error.load(Ordering::Relaxed);
+            state.rx_error.store(0, Ordering::Relaxed);
+            val
+        });
+
+        if errs & RXE_NOISE != 0 {
+            Some(Error::Noise)
+        } else if errs & RXE_PARITYERR != 0 {
+            Some(Error::Parity)
+        } else if errs & RXE_FRAMERR != 0 {
+            Some(Error::Framing)
+        } else if errs & RXE_BREAK != 0 {
+            Some(Error::Break)
+        } else {
+            None
+        }
+    }
+
+    fn try_read(info: &Info, state: &State, buf: &mut [u8]) -> Poll<Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut rx_reader = unsafe { state.rx_buf.reader() };
+        let n = rx_reader.pop(|data| {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            n
+        });
+
+        let result = if n == 0 {
+            match Self::get_rx_error(state) {
+                None => return Poll::Pending,
+                Some(e) => Err(e),
+            }
+        } else {
+            Ok(n)
+        };
+
+        // (Re-)Enable the interrupt to receive more data in case it was
+        // disabled because the buffer was full or errors were detected.
+        info.regs().fifointenset().write(|w| w.rxlvl().set_bit());
+
+        Poll::Ready(result)
+    }
+
+    /// Read from UART RX buffer blocking execution until done.
+    pub fn blocking_read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        loop {
+            match Self::try_read(self.info, self.state, buf) {
+                Poll::Ready(res) => return res,
+                Poll::Pending => continue,
+            }
+        }
+    }
+
+    fn fill_buf<'a>(state: &'static State) -> impl Future<Output = Result<&'a [u8]>> {
+        poll_fn(move |cx| {
+            let mut rx_reader = unsafe { state.rx_buf.reader() };
+            let (p, n) = rx_reader.pop_buf();
+            let result = if n == 0 {
+                match Self::get_rx_error(state) {
+                    None => {
+                        state.rx_waker.register(cx.waker());
+                        return Poll::Pending;
+                    }
+                    Some(e) => Err(e),
+                }
+            } else {
+                let buf = unsafe { slice::from_raw_parts(p, n) };
+                Ok(buf)
+            };
+
+            Poll::Ready(result)
+        })
+    }
+
+    fn consume(info: &Info, state: &State, amt: usize) {
+        let mut rx_reader = unsafe { state.rx_buf.reader() };
+        rx_reader.pop_done(amt);
+
+        // (Re-)Enable the interrupt to receive more data in case it was
+        // disabled because the buffer was full or errors were detected.
+        info.regs().fifointenset().write(|w| w.rxlvl().set_bit());
+    }
+
+    /// we are ready to read if there is data in the buffer
+    fn read_ready(state: &State) -> Result<bool> {
+        Ok(!state.rx_buf.is_empty())
+    }
+}
+
+impl BufferedUartTx {
+    /// Create a new buffered UART TX.
+    pub fn new<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
+        tx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        tx.as_tx();
+
+        let _flexcomm = super::Uart::<Async>::init::<T>(Some(tx.into().reborrow()), None, None, None, config)?;
+        init_buffers(T::info(), T::buffered_state(), Some(tx_buffer), None);
+
+        Ok(Self {
+            info: T::info(),
+            state: T::buffered_state(),
+            _flexcomm,
+        })
+    }
+
+    /// Create a new buffered UART TX with flow control.
+    pub fn new_with_cts<'d, T: Instance>(
+        _uart: Peri<'d, T>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
+        cts: Peri<'d, impl CtsPin<T>>,
+        tx_buffer: &'d mut [u8],
+        config: Config,
+    ) -> Result<Self> {
+        tx.as_tx();
+        cts.as_cts();
+
+        let _flexcomm =
+            super::Uart::<Async>::init::<T>(Some(tx.into().reborrow()), None, None, Some(cts.into()), config)?;
+        init_buffers(T::info(), T::buffered_state(), Some(tx_buffer), None);
+
+        Ok(Self {
+            info: T::info(),
+            state: T::buffered_state(),
+            _flexcomm,
+        })
+    }
+
+    fn write<'d>(
+        info: &'static Info,
+        state: &'static State,
+        buf: &'d [u8],
+    ) -> impl Future<Output = Result<usize>> + 'd {
+        poll_fn(move |cx| {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            let mut tx_writer = unsafe { state.tx_buf.writer() };
+            let n = tx_writer.push(|data| {
+                let n = data.len().min(buf.len());
+                data[..n].copy_from_slice(&buf[..n]);
+                n
+            });
+            if n == 0 {
+                state.tx_waker.register(cx.waker());
+                return Poll::Pending;
+            }
+
+            // The TX interrupt only triggers when the there was data in the
+            // FIFO and the number of bytes drops below a threshold. When the
+            // FIFO was empty we have to manually pend the interrupt to shovel
+            // TX data from the buffer into the FIFO.
+            info.interrupt.pend();
+            Poll::Ready(Ok(n))
+        })
+    }
+
+    fn flush(state: &'static State) -> impl Future<Output = Result<()>> {
+        poll_fn(move |cx| {
+            if !state.tx_buf.is_empty() {
+                state.tx_waker.register(cx.waker());
+                return Poll::Pending;
+            }
+
+            Poll::Ready(Ok(()))
+        })
+    }
+
+    /// Write to UART TX buffer blocking execution until done.
+    pub fn blocking_write(&mut self, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let mut tx_writer = unsafe { self.state.tx_buf.writer() };
+            let n = tx_writer.push(|data| {
+                let n = data.len().min(buf.len());
+                data[..n].copy_from_slice(&buf[..n]);
+                n
+            });
+
+            if n != 0 {
+                // The TX interrupt only triggers when the there was data in the
+                // FIFO and the number of bytes drops below a threshold. When the
+                // FIFO was empty we have to manually pend the interrupt to shovel
+                // TX data from the buffer into the FIFO.
+                self.info.interrupt.pend();
+                return Ok(n);
+            }
+        }
+    }
+
+    /// Flush UART TX blocking execution until done.
+    pub fn blocking_flush(&mut self) -> Result<()> {
+        loop {
+            if self.state.tx_buf.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Check if UART is busy.
+    pub fn busy(&self) -> bool {
+        self.info.regs().stat().read().txidle().bit_is_clear()
+    }
+}
+
+impl Drop for BufferedUartRx {
+    fn drop(&mut self) {
+        unsafe { self.state.rx_buf.deinit() }
+
+        // TX is inactive if the buffer is not available.
+        // We can now unregister the interrupt handler
+        if !self.state.tx_buf.is_available() {
+            self.info.interrupt.disable();
+        }
+    }
+}
+
+impl Drop for BufferedUartTx {
+    fn drop(&mut self) {
+        unsafe { self.state.tx_buf.deinit() }
+
+        // RX is inactive if the buffer is not available.
+        // We can now unregister the interrupt handler
+        if !self.state.rx_buf.is_available() {
+            self.info.interrupt.disable();
+        }
+    }
+}
+
+/// Interrupt handler.
 pub struct BufferedInterruptHandler<T: Instance> {
     _uart: PhantomData<T>,
 }
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for BufferedInterruptHandler<T> {
     unsafe fn on_interrupt() {
-        let regs = T::info().regs;
+        let regs = T::info().regs();
         let stat = regs.intstat().read();
 
+        // if r.uartdmacr().read().rxdmae() {
+        //     return;
+        // }
+
+        let s = T::buffered_state();
+
+        // Clear TX and error interrupt flags
         if stat.txidle().bit_is_set()
             || stat.framerrint().bit_is_set()
             || stat.parityerrint().bit_is_set()
@@ -55,410 +545,321 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for BufferedInterr
                     .aberrclr()
                     .set_bit()
             });
-            T::waker().wake();
         }
-        let fifostat = regs.fifointstat().read();
-        if fifostat.txlvl().bit_is_set() || fifostat.txerr().bit_is_set() {
+
+        // Errors
+        if stat.framerrint().bit_is_set() {
+            warn!("Framing error");
+        }
+        if stat.parityerrint().bit_is_set() {
+            warn!("Parity error");
+        }
+        if stat.rxnoiseint().bit_is_set() {
+            warn!("Noise error");
+        }
+        if stat.deltarxbrk().bit_is_set() {
+            warn!("Break error");
+        }
+
+        if regs.fifointstat().read().txlvl().bit_is_set() || regs.fifointstat().read().txerr().bit_is_set() {
             regs.fifointenclr().write(|w| w.txlvl().set_bit().txerr().set_bit());
         }
-        if fifostat.rxlvl().bit_is_set() || fifostat.rxerr().bit_is_set() {
+
+        if regs.fifointstat().read().rxlvl().bit_is_set() || regs.fifointstat().read().rxerr().bit_is_set() {
             regs.fifointenclr().write(|w| w.rxlvl().set_bit().rxerr().set_bit());
         }
-    }
-}
 
-/// Buffered Uart driver.
-pub struct BufferedUart<'a> {
-    info: Info,
-    tx: UartTx<'a, Async>,
-    rx: BufferedUartRx<'a>,
-}
-
-impl<'a> BufferedUart<'a> {
-    /// Create a new buffered UART with DMA support.
-    pub fn new<T: Instance>(
-        _inner: Peri<'a, T>,
-        tx: Peri<'a, impl TxPin<T>>,
-        rx: Peri<'a, impl RxPin<T>>,
-        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
-        tx_dma: Peri<'a, impl TxDma<T>>,
-        rx_dma: Peri<'a, impl RxDma<T>>,
-        config: Config,
-        rx_buffer: &'static mut [u8],
-        polling_rate_us: u64,
-    ) -> Result<Self> {
-        if rx_buffer.len() > 1024 {
-            return Err(Error::InvalidArgument);
-        }
-        let mid = rx_buffer.len() / 2;
-        if mid == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let (dma_buf, ring_buffer) = rx_buffer.split_at_mut(mid);
-
-        tx.as_tx();
-        rx.as_rx();
-
-        let tx = tx.into();
-        let rx = rx.into();
-
-        T::Interrupt::unpend();
-        unsafe { T::Interrupt::enable() };
-
-        let tx_dma = dma::Dma::reserve_channel(tx_dma);
-        let rx_dma: Channel<'_> = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
-
-        T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
-
-        // Save buffer pointer and length before moving dma_buf
-        let rx_ptr = dma_buf.as_mut_ptr();
-        let rx_len = dma_buf.len();
-
-        // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
-            dma::transfer::Direction::PeripheralToMemory,
-            T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            rx_ptr as *mut u32,
-            rx_len,
-            dma::transfer::TransferOptions {
-                width: dma::transfer::Width::Bit8,
-                priority: dma::transfer::Priority::Priority0,
-                mode: transfer::Mode::Continuous,
-                trigger: transfer::Trigger::Software,
-            },
-        );
-        rx_dma.enable_channel();
-        rx_dma.trigger_channel();
-
-        let flexcomm = Uart::<'a, Async>::init::<T>(Some(tx.into()), Some(rx.into()), None, None, config)?;
-        init_buffers(T::buffered_state(), Some(ring_buffer));
-
-        Ok(Self {
-            info: T::info(),
-            tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
-            rx: BufferedUartRx {
-                info: T::info(),
-                state: T::buffered_state(),
-                _buffer_config: Some(BufferConfig {
-                    dma_buf: dma_buf,
-                    dma_last_write_index: 0,
-                    polling_rate: polling_rate_us,
-                }),
-                _rx_dma: Some(rx_dma),
-            },
-        })
-    }
-
-    pub fn new_with_rtscts<T: Instance>(
-        _inner: Peri<'a, T>,
-        tx: Peri<'a, impl TxPin<T>>,
-        rx: Peri<'a, impl RxPin<T>>,
-        rts: Peri<'a, impl RtsPin<T>>,
-        cts: Peri<'a, impl CtsPin<T>>,
-        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
-        tx_dma: Peri<'a, impl TxDma<T>>,
-        rx_dma: Peri<'a, impl RxDma<T>>,
-        config: Config,
-        rx_buffer: &'static mut [u8],
-        polling_rate_us: u64,
-    ) -> Result<Self> {
-        if rx_buffer.len() > 1024 {
-            return Err(Error::InvalidArgument);
-        }
-        let mid = rx_buffer.len() / 2;
-        if mid == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let (dma_buf, ring_buffer) = rx_buffer.split_at_mut(mid);
-
-        tx.as_tx();
-        rx.as_rx();
-        rts.as_rts();
-        cts.as_cts();
-
-        let tx = tx.into();
-        let rx = rx.into();
-        let rts = rts.into();
-        let cts = cts.into();
-
-        let tx_dma = dma::Dma::reserve_channel(tx_dma);
-        let rx_dma: Channel<'_> = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
-
-        T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
-
-        // Save buffer pointer and length before moving dma_buf
-        let rx_ptr = dma_buf.as_mut_ptr();
-        let rx_len = dma_buf.len();
-
-        // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
-            dma::transfer::Direction::PeripheralToMemory,
-            T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            rx_ptr as *mut u32,
-            rx_len,
-            dma::transfer::TransferOptions {
-                width: dma::transfer::Width::Bit8,
-                priority: dma::transfer::Priority::Priority0,
-                mode: transfer::Mode::Continuous,
-                trigger: transfer::Trigger::Software,
-            },
-        );
-        rx_dma.enable_channel();
-        rx_dma.trigger_channel();
-
-        let flexcomm = Uart::<'a, Async>::init::<T>(
-            Some(tx.into()),
-            Some(rx.into()),
-            Some(rts.into()),
-            Some(cts.into()),
-            config,
-        )?;
-        init_buffers(T::buffered_state(), Some(ring_buffer));
-
-        Ok(Self {
-            info: T::info(),
-            tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
-            rx: BufferedUartRx {
-                info: T::info(),
-                state: T::buffered_state(),
-                _buffer_config: Some(BufferConfig {
-                    dma_buf: dma_buf,
-                    dma_last_write_index: 0,
-                    polling_rate: polling_rate_us,
-                }),
-                _rx_dma: Some(rx_dma),
-            },
-        })
-    }
-
-    pub fn split(self) -> (UartTx<'a, Async>, BufferedUartRx<'a>) {
-        (self.tx, self.rx)
-    }
-}
-
-/// Buffered Uart RX driver
-pub struct BufferedUartRx<'a> {
-    info: Info,
-    state: &'static BufferedUartState,
-    _buffer_config: Option<BufferConfig>,
-    _rx_dma: Option<Channel<'a>>,
-}
-
-impl<'a> BufferedUartRx<'a> {
-    /// Create a new buffered UART RX with DMA support.
-    pub fn new<T: Instance>(
-        _inner: Peri<'a, T>,
-        rx: Peri<'a, impl RxPin<T>>,
-        _irq: impl interrupt::typelevel::Binding<T::Interrupt, BufferedInterruptHandler<T>>,
-        rx_dma: Peri<'a, impl RxDma<T>>,
-        config: Config,
-        rx_buffer: &'static mut [u8],
-        polling_rate_us: u64,
-    ) -> Result<Self> {
-        if rx_buffer.len() > 1024 {
-            return Err(Error::InvalidArgument);
-        }
-        let mid = rx_buffer.len() / 2;
-        if mid == 0 {
-            return Err(Error::InvalidArgument);
-        }
-        let (dma_buf, ring_buffer) = rx_buffer.split_at_mut(mid);
-
-        rx.as_rx();
-
-        let mut _rx = rx.into();
-
-        T::Interrupt::unpend();
-        unsafe { T::Interrupt::enable() };
-
-        let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
-        T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
-
-        // Save buffer pointer and length before moving dma_buf
-        let rx_ptr = dma_buf.as_mut_ptr();
-        let rx_len = dma_buf.len();
-
-        // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
-            dma::transfer::Direction::PeripheralToMemory,
-            T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            rx_ptr as *mut u32,
-            rx_len,
-            dma::transfer::TransferOptions {
-                width: dma::transfer::Width::Bit8,
-                priority: dma::transfer::Priority::Priority0,
-                mode: transfer::Mode::Continuous,
-                trigger: transfer::Trigger::Software,
-            },
-        );
-        rx_dma.enable_channel();
-        rx_dma.trigger_channel();
-
-        let _flexcomm = Uart::<Async>::init::<T>(None, Some(_rx.reborrow()), None, None, config)?;
-        init_buffers(T::buffered_state(), Some(ring_buffer));
-
-        Ok(Self {
-            info: T::info(),
-            state: T::buffered_state(),
-            _buffer_config: Some(BufferConfig {
-                dma_buf: dma_buf,
-                dma_last_write_index: 0,
-                polling_rate: polling_rate_us,
-            }),
-            _rx_dma: Some(rx_dma),
-        })
-    }
-
-    fn ring_push_all(ring: &RingBuffer, mut data: &[u8]) -> usize {
-        let mut total_pushed = 0;
-
-        while !data.is_empty() {
-            let mut writer = unsafe { ring.writer() };
-            let (ptr, n) = writer.push_buf();
-            if n == 0 {
-                break; // Ring buffer is full, stop pushing data until next polling
-            }
-            let to_copy = n.min(data.len());
-            unsafe {
-                core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, to_copy);
-            }
-            writer.push_done(to_copy);
-
-            total_pushed += to_copy;
-            data = &data[to_copy..];
-        }
-
-        total_pushed
-    }
-
-    async fn read_buffered_new(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // unwrap safe here as only entry path to API requires rx_dma instance
-        let rx_dma = self._rx_dma.as_ref().unwrap();
-        let buffer_config = self._buffer_config.as_mut().unwrap();
-        let ring_buffer = &self.state.ring_buf;
-
-        let mut bytes_read = 0;
-        let mut write_index: usize = 0;
-        let mut read_index: usize = 0;
-
-        // As the Rx Idle interrupt is not present for this processor, we must poll to see if new data is available
-        loop {
-            // If there is data in the ring buffer, read and return it
-            {
-                let mut reader = unsafe { ring_buffer.reader() };
-                let (ptr, avail) = reader.pop_buf();
-
-                if avail > 0 {
-                    let n = avail.min(buf.len() - bytes_read);
-                    let src = unsafe { core::slice::from_raw_parts(ptr, n) };
-                    buf[bytes_read..bytes_read + n].copy_from_slice(src);
-                    reader.pop_done(n);
-                    bytes_read += n;
-                    
-                    if bytes_read >= buf.len() {
-                        return Ok(bytes_read);
-                    }
+        // RX
+        if s.rx_buf.is_available() {
+            let mut rx_writer = unsafe { s.rx_buf.writer() };
+            let rx_buf = rx_writer.push_slice();
+            let mut n_read = 0;
+            let mut error = false;
+            for rx_byte in rx_buf {
+                if regs.fifostat().read().rxnotempty().bit_is_clear() {
+                    // RX FIFO is empty, stop.
+                    break;
                 }
-            }
-            if rx_dma.is_active() {
-                let mut remaining_bytes = rx_dma.get_xfer_count() as usize;
-                remaining_bytes += 1;
-
-                if remaining_bytes > buffer_config.dma_buf.len() {
-                    return Err(Error::InvalidArgument);
+                let stat = regs.stat().read().bits();
+                if (stat & (RXE_BREAK | RXE_FRAMERR | RXE_NOISE | RXE_PARITYERR)) != 0 {
+                    critical_section::with(|_| {
+                        let val = s.rx_error.load(Ordering::Relaxed);
+                        s.rx_error.store(val | stat, Ordering::Relaxed);
+                    });
+                    error = true;
+                    // only fill the buffer with valid characters. the current character is fine
+                    // if the error is an overrun, but if we add it to the buffer we'll report
+                    // the overrun one character too late. drop it instead and pretend we were
+                    // a bit slower at draining the rx fifo than we actually were.
+                    // this is consistent with blocking uart error reporting.
+                    break;
                 }
-
-                // determine current write index where transfer will continue to
-                write_index = (buffer_config.dma_buf.len() - remaining_bytes) % buffer_config.dma_buf.len();
+                *rx_byte = regs.fiford().read().rxdata().bits() as u8;
+                n_read += 1;
             }
-
-            read_index = buffer_config.dma_last_write_index;
-
-            if write_index != read_index {
-                if write_index > read_index {
-                    let slice = &buffer_config.dma_buf[read_index..write_index];
-                    let pushed = Self::ring_push_all(ring_buffer, slice);
-                    read_index = read_index + pushed;
-                } else {
-                    // handle roll over
-                    let slice1 = &buffer_config.dma_buf[read_index..buffer_config.dma_buf.len()];
-                    let pushed1 = Self::ring_push_all(ring_buffer, slice1);
-                    read_index = (read_index + pushed1) % buffer_config.dma_buf.len();
-
-                    // still have more to push from begining of buffer
-                    if pushed1 == slice1.len() && write_index > 0 {
-                        let slice2 = &buffer_config.dma_buf[0..write_index];
-                        let pushed2 = Self::ring_push_all(ring_buffer, slice2);
-                        read_index = pushed2;
-                    }
-                }
-                buffer_config.dma_last_write_index = read_index;
-            } else {
-                // sleep until next polling epoch, or if we detect a there is data in ringbuffer or error event
-                let res = select(
-                    // use embassy_time to enable polling the bus for more data
-                    embassy_time::Timer::after_micros(buffer_config.polling_rate),
-                    // detect bus errors
-                    poll_fn(|cx| {
-                        self.info.waker.register(cx.waker());
-
-                        self.info.regs.intenset().write(|w| {
-                            w.framerren()
-                                .set_bit()
-                                .parityerren()
-                                .set_bit()
-                                .rxnoiseen()
-                                .set_bit()
-                                .aberren()
-                                .set_bit()
-                        });
-
-                        let stat = self.info.regs.stat().read();
-
-                        self.info.regs.stat().write(|w| {
-                            w.framerrint()
-                                .clear_bit_by_one()
-                                .parityerrint()
-                                .clear_bit_by_one()
-                                .rxnoiseint()
-                                .clear_bit_by_one()
-                                .aberr()
-                                .clear_bit_by_one()
-                        });
-
-                        if stat.framerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Framing))
-                        } else if stat.parityerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Parity))
-                        } else if stat.rxnoiseint().bit_is_set() {
-                            Poll::Ready(Err(Error::Noise))
-                        } else if stat.aberr().bit_is_set() {
-                            Poll::Ready(Err(Error::Fail))
-                        } else {
-                            Poll::Pending
-                        }
-                    }),
-                )
-                .await;
-
-                match res {
-                    Either::First(()) => {}
-                    Either::Second(Ok(())) => (),
-                    Either::Second(Err(e)) => {
-                        return Err(e);
-                    }
-                }
+            if n_read > 0 {
+                rx_writer.push_done(n_read);
+                s.rx_waker.wake();
+            } else if error {
+                s.rx_waker.wake();
             }
+            // Disable any further RX interrupts when the buffer becomes full or
+            // errors have occurred. This lets us buffer additional errors in the
+            // fifo without needing more error storage locations, and most applications
+            // will want to do a full reset of their uart state anyway once an error
+            // has happened.
+            if s.rx_buf.is_full() || error {
+                regs.fifointenclr().write(|w| w.rxlvl().set_bit());
+            }
+        }
+
+        // TX
+        if s.tx_buf.is_available() {
+            let mut tx_reader = unsafe { s.tx_buf.reader() };
+            let tx_buf = tx_reader.pop_slice();
+            let mut n_written = 0;
+            for tx_byte in tx_buf.iter_mut() {
+                if regs.fifostat().read().txnotfull().bit_is_clear() {
+                    // FIFO is full, stop.
+                    break;
+                }
+                regs.fifowr().write(|w| unsafe { w.txdata().bits(u16::from(*tx_byte)) });
+                n_written += 1;
+            }
+            if n_written > 0 {
+                tx_reader.pop_done(n_written);
+                s.tx_waker.wake();
+            }
+            // The TX interrupt only triggers once when the FIFO threshold is
+            // crossed. No need to disable it when the buffer becomes empty
+            // as it does re-trigger anymore once we have cleared it.
         }
     }
 }
 
-impl embedded_io_async::ErrorType for BufferedUartRx<'_> {
+impl embedded_io_async::ErrorType for BufferedUart {
     type Error = Error;
 }
 
-impl embedded_io_async::Read for BufferedUartRx<'_> {
+impl embedded_io_async::ErrorType for BufferedUartRx {
+    type Error = Error;
+}
+
+impl embedded_io_async::ErrorType for BufferedUartTx {
+    type Error = Error;
+}
+
+impl embedded_io_async::Read for BufferedUart {
     async fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, Self::Error> {
-        self.read_buffered_new(buf).await
+        BufferedUartRx::read(self.rx.info, self.rx.state, buf).await
+    }
+}
+
+impl embedded_io_async::Read for BufferedUartRx {
+    async fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, Self::Error> {
+        Self::read(self.info, self.state, buf).await
+    }
+}
+
+impl embedded_io_async::ReadReady for BufferedUart {
+    fn read_ready(&mut self) -> core::result::Result<bool, Self::Error> {
+        BufferedUartRx::read_ready(self.rx.state)
+    }
+}
+
+impl embedded_io_async::ReadReady for BufferedUartRx {
+    fn read_ready(&mut self) -> core::result::Result<bool, Self::Error> {
+        Self::read_ready(self.state)
+    }
+}
+
+impl embedded_io_async::BufRead for BufferedUart {
+    async fn fill_buf(&mut self) -> core::result::Result<&[u8], Self::Error> {
+        BufferedUartRx::fill_buf(self.rx.state).await
+    }
+
+    fn consume(&mut self, amt: usize) {
+        BufferedUartRx::consume(self.rx.info, self.rx.state, amt)
+    }
+}
+
+impl embedded_io_async::BufRead for BufferedUartRx {
+    async fn fill_buf(&mut self) -> core::result::Result<&[u8], Self::Error> {
+        Self::fill_buf(self.state).await
+    }
+
+    fn consume(&mut self, amt: usize) {
+        Self::consume(self.info, self.state, amt)
+    }
+}
+
+impl embedded_io_async::Write for BufferedUart {
+    async fn write(&mut self, buf: &[u8]) -> core::result::Result<usize, Self::Error> {
+        BufferedUartTx::write(self.tx.info, self.tx.state, buf).await
+    }
+
+    async fn flush(&mut self) -> core::result::Result<(), Self::Error> {
+        BufferedUartTx::flush(self.tx.state).await
+    }
+}
+
+impl embedded_io_async::Write for BufferedUartTx {
+    async fn write(&mut self, buf: &[u8]) -> core::result::Result<usize, Self::Error> {
+        Self::write(self.info, self.state, buf).await
+    }
+
+    async fn flush(&mut self) -> core::result::Result<(), Self::Error> {
+        Self::flush(self.state).await
+    }
+}
+
+impl embedded_io::Read for BufferedUart {
+    fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, Self::Error> {
+        self.rx.blocking_read(buf)
+    }
+}
+
+impl embedded_io::Read for BufferedUartRx {
+    fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, Self::Error> {
+        self.blocking_read(buf)
+    }
+}
+
+impl embedded_io::Write for BufferedUart {
+    fn write(&mut self, buf: &[u8]) -> core::result::Result<usize, Self::Error> {
+        self.tx.blocking_write(buf)
+    }
+
+    fn flush(&mut self) -> core::result::Result<(), Self::Error> {
+        self.tx.blocking_flush()
+    }
+}
+
+impl embedded_io::Write for BufferedUartTx {
+    fn write(&mut self, buf: &[u8]) -> core::result::Result<usize, Self::Error> {
+        self.blocking_write(buf)
+    }
+
+    fn flush(&mut self) -> core::result::Result<(), Self::Error> {
+        self.blocking_flush()
+    }
+}
+
+impl embedded_hal_02::serial::Read<u8> for BufferedUartRx {
+    type Error = Error;
+
+    fn read(&mut self) -> core::result::Result<u8, nb::Error<Self::Error>> {
+        if self.info.regs().fifostat().read().rxnotempty().bit_is_clear() {
+            Err(nb::Error::WouldBlock)
+        } else if self.info.regs().fifostat().read().rxerr().bit_is_set() {
+            self.info.regs().fifocfg().modify(|_, w| w.emptyrx().set_bit());
+            self.info.regs().fifostat().modify(|_, w| w.rxerr().set_bit());
+            Err(nb::Error::Other(Error::Read))
+        } else if self.info.regs().stat().read().parityerrint().bit_is_set() {
+            self.info
+                .regs()
+                .stat()
+                .modify(|_, w| w.parityerrint().clear_bit_by_one());
+            Err(nb::Error::Other(Error::Parity))
+        } else if self.info.regs().stat().read().framerrint().bit_is_set() {
+            self.info.regs().stat().modify(|_, w| w.framerrint().clear_bit_by_one());
+            Err(nb::Error::Other(Error::Framing))
+        } else if self.info.regs().stat().read().rxnoiseint().bit_is_set() {
+            self.info.regs().stat().modify(|_, w| w.rxnoiseint().clear_bit_by_one());
+            Err(nb::Error::Other(Error::Noise))
+        } else {
+            let byte = self.info.regs().fiford().read().rxdata().bits() as u8;
+            Ok(byte)
+        }
+    }
+}
+
+impl embedded_hal_02::blocking::serial::Write<u8> for BufferedUartTx {
+    type Error = Error;
+
+    fn bwrite_all(&mut self, mut buffer: &[u8]) -> core::result::Result<(), Self::Error> {
+        while !buffer.is_empty() {
+            match self.blocking_write(buffer) {
+                Ok(0) => panic!("zero-length write."),
+                Ok(n) => buffer = &buffer[n..],
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn bflush(&mut self) -> core::result::Result<(), Self::Error> {
+        self.blocking_flush()
+    }
+}
+
+impl embedded_hal_02::serial::Read<u8> for BufferedUart {
+    type Error = Error;
+
+    fn read(&mut self) -> core::result::Result<u8, nb::Error<Self::Error>> {
+        embedded_hal_02::serial::Read::read(&mut self.rx)
+    }
+}
+
+impl embedded_hal_02::blocking::serial::Write<u8> for BufferedUart {
+    type Error = Error;
+
+    fn bwrite_all(&mut self, mut buffer: &[u8]) -> core::result::Result<(), Self::Error> {
+        while !buffer.is_empty() {
+            match self.blocking_write(buffer) {
+                Ok(0) => panic!("zero-length write."),
+                Ok(n) => buffer = &buffer[n..],
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn bflush(&mut self) -> core::result::Result<(), Self::Error> {
+        self.blocking_flush()
+    }
+}
+
+impl embedded_hal_nb::serial::ErrorType for BufferedUartRx {
+    type Error = Error;
+}
+
+impl embedded_hal_nb::serial::ErrorType for BufferedUartTx {
+    type Error = Error;
+}
+
+impl embedded_hal_nb::serial::ErrorType for BufferedUart {
+    type Error = Error;
+}
+
+impl embedded_hal_nb::serial::Read for BufferedUartRx {
+    fn read(&mut self) -> nb::Result<u8, Self::Error> {
+        embedded_hal_02::serial::Read::read(self)
+    }
+}
+
+impl embedded_hal_nb::serial::Write for BufferedUartTx {
+    fn write(&mut self, char: u8) -> nb::Result<(), Self::Error> {
+        self.blocking_write(&[char]).map(drop).map_err(nb::Error::Other)
+    }
+
+    fn flush(&mut self) -> nb::Result<(), Self::Error> {
+        self.blocking_flush().map_err(nb::Error::Other)
+    }
+}
+
+impl embedded_hal_nb::serial::Read for BufferedUart {
+    fn read(&mut self) -> core::result::Result<u8, nb::Error<Self::Error>> {
+        embedded_hal_02::serial::Read::read(&mut self.rx)
+    }
+}
+
+impl embedded_hal_nb::serial::Write for BufferedUart {
+    fn write(&mut self, char: u8) -> nb::Result<(), Self::Error> {
+        self.blocking_write(&[char]).map(drop).map_err(nb::Error::Other)
+    }
+
+    fn flush(&mut self) -> nb::Result<(), Self::Error> {
+        self.blocking_flush().map_err(nb::Error::Other)
     }
 }
