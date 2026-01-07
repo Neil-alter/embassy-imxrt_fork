@@ -2,6 +2,8 @@
 
 use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
+#[cfg(feature = "time")]
+use core::ptr::NonNull;
 use core::task::Poll;
 
 #[cfg(feature = "time")]
@@ -225,14 +227,15 @@ impl<'a> UartTx<'a, Blocking> {
     }
 }
 
+#[cfg(not(feature = "time"))]
+struct BufferConfig {}
+
+#[cfg(feature = "time")]
 struct BufferConfig {
-    #[cfg(feature = "time")]
-    buffer: &'static mut [u8],
-    #[cfg(feature = "time")]
+    buffer_ptr: NonNull<u8>,
+    buffer_len: usize,
     dma_last_pos: usize,
-    #[cfg(feature = "time")]
     polling_rate: u64,
-    #[cfg(feature = "time")]
     bb_overrun: bool,
 }
 
@@ -689,6 +692,13 @@ impl<'a> UartTx<'a, Async> {
     }
 }
 
+#[cfg(feature = "time")]
+fn to_nn_len(buffer: &'static mut [u8]) -> (NonNull<u8>, usize) {
+    let buffer_ptr = unsafe { NonNull::new_unchecked(buffer.as_mut_ptr()) };
+    let buffer_len = buffer.len();
+    (buffer_ptr, buffer_len)
+}
+
 impl<'a> UartRx<'a, Async> {
     /// Create a new DMA enabled UART which can only receive data
     pub fn new_async<T: Instance>(
@@ -736,14 +746,17 @@ impl<'a> UartRx<'a, Async> {
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
         // immediately configure and enable channel for circular buffered reception
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does this need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -757,7 +770,8 @@ impl<'a> UartRx<'a, Async> {
             flexcomm,
             Some(rx_dma),
             Some(BufferConfig {
-                buffer,
+                buffer_ptr,
+                buffer_len,
                 dma_last_pos: 0,
                 polling_rate: polling_rate_us,
                 bb_overrun: false,
@@ -859,9 +873,10 @@ impl<'a> UartRx<'a, Async> {
         const CHUNK: usize = 1024;
 
         let prod = info.bb.stream_producer();
+        let dma_len = cfg.buffer_len;
 
-        let dma_len = cfg.buffer.len();
         let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
         let current_pos = (dma_len - remaining_bytes) % dma_len;
 
         if current_pos == cfg.dma_last_pos {
@@ -892,12 +907,34 @@ impl<'a> UartRx<'a, Async> {
         let end = (start + n) % dma_len;
         if start < end {
             // straightforward copy
-            g[..n].copy_from_slice(&cfg.buffer[start..end]);
+            // TODO(AJM): This is not really fully sound. There is no guard that access from DMA is not
+            // aliasing at any point. By using a NN ptr (instead of a slice), and by using a compiler
+            // fence AFTER we read the number of bytes available in the DMA transfer, we hope to ideally
+            // prevent miscompilations, and avoid racing reads.
+            unsafe {
+                let dma_start_ptr = cfg.buffer_ptr.add(start).as_ptr();
+                let grant_start_ptr = g.as_mut_ptr();
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, n);
+            }
         } else {
             // rollover copy
             let first = dma_len - start;
-            g[..first].copy_from_slice(&cfg.buffer[start..dma_len]);
-            g[first..n].copy_from_slice(&cfg.buffer[0..end]);
+
+            // TODO(AJM): This is not really fully sound. There is no guard that access from DMA is not
+            // aliasing at any point. By using a NN ptr (instead of a slice), and by using a compiler
+            // fence AFTER we read the number of bytes available in the DMA transfer, we hope to ideally
+            // prevent miscompilations, and avoid racing reads.
+            unsafe {
+                // g[..first].copy_from_slice(&cfg.buffer[start..dma_len]);
+                let dma_start_ptr = cfg.buffer_ptr.add(start).as_ptr();
+                let grant_start_ptr = g.as_mut_ptr();
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, first);
+
+                // g[first..n].copy_from_slice(&cfg.buffer[0..end]);
+                let dma_start_ptr = cfg.buffer_ptr.as_ptr();
+                let grant_start_ptr = g.as_mut_ptr().add(first);
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, end);
+            }
         }
 
         g.commit(n);
@@ -944,7 +981,7 @@ impl<'a> UartRx<'a, Async> {
                 }
 
                 // Update DMA index to current position to avoid read previous data next time
-                let dma_len = cfg.buffer.len();
+                let dma_len = cfg.buffer_len;
                 let rx_dma = _rx_dma.as_ref().unwrap();
                 let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
                 cfg.dma_last_pos = (dma_len - remaining_bytes) % dma_len;
@@ -1085,6 +1122,8 @@ impl<'a> Uart<'a, Async> {
         let tx = tx.into();
         let rx = rx.into();
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
 
@@ -1094,8 +1133,9 @@ impl<'a> Uart<'a, Async> {
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does our buffer need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1112,7 +1152,8 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
+                    buffer_ptr,
+                    buffer_len,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
                     bb_overrun: false,
@@ -1194,6 +1235,8 @@ impl<'a> Uart<'a, Async> {
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::InvalidArgument)?;
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let flexcomm = Self::init::<T>(
             Some(tx.into()),
             Some(rx.into()),
@@ -1206,8 +1249,9 @@ impl<'a> Uart<'a, Async> {
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does this need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1224,7 +1268,8 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
+                    buffer_ptr,
+                    buffer_len,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
                     bb_overrun: false,
@@ -1566,6 +1611,7 @@ macro_rules! impl_instance {
                         Info {
                             regs: unsafe { &*crate::pac::[<Usart $n>]::ptr() },
                             waker: Self::waker(),
+                            #[cfg(feature = "time")]
                             bb: Self::bb(),
                         }
                     }
