@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
 #[cfg(feature = "time")]
-use bbqueue::BBBuffer;
+use bbq2::nicknames::Churrasco;
 use embassy_futures::select::{Either, select};
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -234,10 +234,6 @@ struct BufferConfig {
     dma_last_pos: usize,
     #[cfg(feature = "time")]
     polling_rate: u64,
-    #[cfg(feature = "time")]
-    bb_prod: Option<bbqueue::Producer<'static, 2048>>,
-    #[cfg(feature = "time")]
-    bb_cons: Option<bbqueue::Consumer<'static, 2048>>,
     #[cfg(feature = "time")]
     bb_overrun: AtomicBool,
 }
@@ -759,8 +755,6 @@ impl<'a> UartRx<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self::new_inner::<T>(
             flexcomm,
             Some(rx_dma),
@@ -768,8 +762,6 @@ impl<'a> UartRx<'a, Async> {
                 buffer,
                 dma_last_pos: 0,
                 polling_rate: polling_rate_us,
-                bb_prod: Some(bb_prod),
-                bb_cons: Some(bb_cons),
                 bb_overrun: AtomicBool::new(false),
             }),
         ))
@@ -869,7 +861,7 @@ impl<'a> UartRx<'a, Async> {
         const CHUNK: usize = 1024;
 
         let cfg = self._buffer_config.as_mut().unwrap();
-        let prod = cfg.bb_prod.as_mut().unwrap();
+        let prod = self.info.bb.stream_producer();
 
         let dma_len = cfg.buffer.len();
         let rx_dma = self._rx_dma.as_ref().unwrap();
@@ -922,6 +914,7 @@ impl<'a> UartRx<'a, Async> {
         let polling_rate = self._buffer_config.as_ref().unwrap().polling_rate;
         // Bytes already read into buf
         let mut bytes_read = 0;
+        let cons = self.info.bb.stream_consumer();
 
         while bytes_read < buf.len() {
             // Try to pump data from DMA buffer into BBQueue
@@ -938,7 +931,6 @@ impl<'a> UartRx<'a, Async> {
                 // Clear the BBQueue and update the DMA index to current position
                 // to avoid reading stale data on subsequent read_buffered calls
                 let cfg = self._buffer_config.as_mut().unwrap();
-                let cons = cfg.bb_cons.as_mut().unwrap();
 
                 // Drain all data from BBQueue
                 while let Ok(g) = cons.read() {
@@ -956,8 +948,6 @@ impl<'a> UartRx<'a, Async> {
             }
 
             // Read from BBQueue
-            let cfg = self._buffer_config.as_mut().unwrap();
-            let cons = cfg.bb_cons.as_mut().unwrap();
             while bytes_read < buf.len() {
                 // Read all available bytes
                 match cons.read() {
@@ -1110,8 +1100,6 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self {
             info: T::info(),
             tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
@@ -1122,8 +1110,6 @@ impl<'a> Uart<'a, Async> {
                     buffer,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
                     bb_overrun: AtomicBool::new(false),
                 }),
             ),
@@ -1226,8 +1212,6 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self {
             info: T::info(),
             tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
@@ -1238,8 +1222,6 @@ impl<'a> Uart<'a, Async> {
                     buffer,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
                     bb_overrun: AtomicBool::new(false),
                 }),
             ),
@@ -1507,6 +1489,8 @@ impl embedded_io_async::Write for Uart<'_, Async> {
 struct Info {
     regs: &'static crate::pac::usart0::RegisterBlock,
     waker: &'static AtomicWaker,
+    #[cfg(feature = "time")]
+    bb: &'static Churrasco<2048>,
 }
 
 // SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
@@ -1518,7 +1502,7 @@ trait SealedInstance {
     fn info() -> Info;
     fn waker() -> &'static AtomicWaker;
     #[cfg(feature = "time")]
-    fn bb() -> &'static BBBuffer<2048>;
+    fn bb() -> &'static Churrasco<2048>;
 }
 
 /// UART interrupt handler.
@@ -1577,6 +1561,7 @@ macro_rules! impl_instance {
                         Info {
                             regs: unsafe { &*crate::pac::[<Usart $n>]::ptr() },
                             waker: Self::waker(),
+                            bb: Self::bb(),
                         }
                     }
 
@@ -1586,8 +1571,8 @@ macro_rules! impl_instance {
                     }
 
                     #[cfg(feature = "time")]
-                    fn bb() -> &'static BBBuffer<2048> {
-                        static BB: BBBuffer<2048> = BBBuffer::new();
+                    fn bb() -> &'static Churrasco<2048> {
+                        static BB: Churrasco<2048> = Churrasco::new();
                         &BB
                     }
                 }
