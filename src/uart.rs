@@ -2,8 +2,6 @@
 
 use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
-#[cfg(feature = "time")]
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
 #[cfg(feature = "time")]
@@ -235,7 +233,7 @@ struct BufferConfig {
     #[cfg(feature = "time")]
     polling_rate: u64,
     #[cfg(feature = "time")]
-    bb_overrun: AtomicBool,
+    bb_overrun: bool,
 }
 
 impl<'a, M: Mode> UartRx<'a, M> {
@@ -762,7 +760,7 @@ impl<'a> UartRx<'a, Async> {
                 buffer,
                 dma_last_pos: 0,
                 polling_rate: polling_rate_us,
-                bb_overrun: AtomicBool::new(false),
+                bb_overrun: false,
             }),
         ))
     }
@@ -856,15 +854,13 @@ impl<'a> UartRx<'a, Async> {
     }
 
     #[cfg(feature = "time")]
-    fn pump_data_into_bb(&mut self) {
+    fn pump_data_into_bb(cfg: &mut BufferConfig, info: &mut Info, rx_dma: &mut Channel<'_>) {
         // Half of the buffer size of BBBqueue
         const CHUNK: usize = 1024;
 
-        let cfg = self._buffer_config.as_mut().unwrap();
-        let prod = self.info.bb.stream_producer();
+        let prod = info.bb.stream_producer();
 
         let dma_len = cfg.buffer.len();
-        let rx_dma = self._rx_dma.as_ref().unwrap();
         let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
         let current_pos = (dma_len - remaining_bytes) % dma_len;
 
@@ -885,7 +881,7 @@ impl<'a> UartRx<'a, Async> {
             Ok(g) => g,
             Err(_) => {
                 // No space in BBQueue, this indicates that the reader is not keeping up.
-                cfg.bb_overrun.store(true, Ordering::Relaxed);
+                cfg.bb_overrun = true;
                 return;
             }
         };
@@ -911,27 +907,36 @@ impl<'a> UartRx<'a, Async> {
     #[cfg(feature = "time")]
     async fn read_buffered(&mut self, buf: &mut [u8]) -> Result<usize> {
         // Extract polling_rate before entering the loop to avoid borrow conflicts
-        let polling_rate = self._buffer_config.as_ref().unwrap().polling_rate;
-        // Bytes already read into buf
-        let mut bytes_read = 0;
-        let cons = self.info.bb.stream_consumer();
+        let orig_len = buf.len();
+        let mut window = buf;
+        let Self {
+            info,
+            _flexcomm,
+            _buffer_config,
+            _rx_dma,
+            _phantom,
+        } = self;
 
-        while bytes_read < buf.len() {
+        // We should always have a buffer config and rx_dma if we are reading buffered.
+        let Some(cfg) = _buffer_config.as_mut() else {
+            return Err(Error::Fail);
+        };
+        let Some(rx_dma) = _rx_dma.as_mut() else {
+            return Err(Error::Fail);
+        };
+        let cons = info.bb.stream_consumer();
+        let polling_rate = cfg.polling_rate;
+
+        while !window.is_empty() {
             // Try to pump data from DMA buffer into BBQueue
-            self.pump_data_into_bb();
+            Self::pump_data_into_bb(cfg, info, rx_dma);
 
             // Overrun occurred - data loss detected
-            if self
-                ._buffer_config
-                .as_ref()
-                .unwrap()
-                .bb_overrun
-                .swap(false, Ordering::Relaxed)
-            {
+            if cfg.bb_overrun {
+                cfg.bb_overrun = false;
                 // Clear the BBQueue and update the DMA index to current position
                 // to avoid reading stale data on subsequent read_buffered calls
-                let cfg = self._buffer_config.as_mut().unwrap();
-
+                //
                 // Drain all data from BBQueue
                 while let Ok(g) = cons.read() {
                     let len = g.len();
@@ -940,7 +945,7 @@ impl<'a> UartRx<'a, Async> {
 
                 // Update DMA index to current position to avoid read previous data next time
                 let dma_len = cfg.buffer.len();
-                let rx_dma = self._rx_dma.as_ref().unwrap();
+                let rx_dma = _rx_dma.as_ref().unwrap();
                 let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
                 cfg.dma_last_pos = (dma_len - remaining_bytes) % dma_len;
 
@@ -948,80 +953,80 @@ impl<'a> UartRx<'a, Async> {
             }
 
             // Read from BBQueue
-            while bytes_read < buf.len() {
-                // Read all available bytes
-                match cons.read() {
-                    Ok(g) => {
-                        let grant_len = g.len();
-                        let n = grant_len.min(buf.len() - bytes_read);
-                        buf[bytes_read..bytes_read + n].copy_from_slice(&g[..n]);
+            //
+            // Read all available bytes. We only read one grant, to allow us to go back and
+            // pump more data from the bbqueue ASAP if required to avoid overruns
+            if let Ok(g) = cons.read() {
+                let grant_len = g.len();
+                let n = grant_len.min(window.len());
+                let (now, later) = window.split_at_mut(n);
 
-                        // Release bytes back to the queue
-                        g.release(n);
+                now.copy_from_slice(&g[..n]);
 
-                        // Bytes read increment
-                        bytes_read += n;
-                    }
-                    // There is no more data available in BBQueue, break to wait for new data
-                    Err(_) => break,
-                };
-            }
+                // Release bytes back to the queue
+                g.release(n);
+
+                // If we're done, break!
+                if later.is_empty() {
+                    break;
+                }
+
+                window = later;
+            };
 
             // If we still need more data, wait for either new data via polling or error condition
-            if bytes_read < buf.len() {
-                let res = select(
-                    embassy_time::Timer::after_micros(polling_rate),
-                    // detect bus errors
-                    poll_fn(|cx| {
-                        self.info.waker.register(cx.waker());
+            let res = select(
+                embassy_time::Timer::after_micros(polling_rate),
+                // detect bus errors
+                poll_fn(|cx| {
+                    info.waker.register(cx.waker());
 
-                        self.info.regs.intenset().write(|w| {
-                            w.framerren()
-                                .set_bit()
-                                .parityerren()
-                                .set_bit()
-                                .rxnoiseen()
-                                .set_bit()
-                                .aberren()
-                                .set_bit()
-                        });
+                    info.regs.intenset().write(|w| {
+                        w.framerren()
+                            .set_bit()
+                            .parityerren()
+                            .set_bit()
+                            .rxnoiseen()
+                            .set_bit()
+                            .aberren()
+                            .set_bit()
+                    });
 
-                        let stat = self.info.regs.stat().read();
+                    let stat = info.regs.stat().read();
 
-                        self.info.regs.stat().write(|w| {
-                            w.framerrint()
-                                .clear_bit_by_one()
-                                .parityerrint()
-                                .clear_bit_by_one()
-                                .rxnoiseint()
-                                .clear_bit_by_one()
-                                .aberr()
-                                .clear_bit_by_one()
-                        });
+                    info.regs.stat().write(|w| {
+                        w.framerrint()
+                            .clear_bit_by_one()
+                            .parityerrint()
+                            .clear_bit_by_one()
+                            .rxnoiseint()
+                            .clear_bit_by_one()
+                            .aberr()
+                            .clear_bit_by_one()
+                    });
 
-                        if stat.framerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Framing))
-                        } else if stat.parityerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Parity))
-                        } else if stat.rxnoiseint().bit_is_set() {
-                            Poll::Ready(Err(Error::Noise))
-                        } else if stat.aberr().bit_is_set() {
-                            Poll::Ready(Err(Error::Fail))
-                        } else {
-                            Poll::Pending
-                        }
-                    }),
-                )
-                .await;
+                    if stat.framerrint().bit_is_set() {
+                        Poll::Ready(Err(Error::Framing))
+                    } else if stat.parityerrint().bit_is_set() {
+                        Poll::Ready(Err(Error::Parity))
+                    } else if stat.rxnoiseint().bit_is_set() {
+                        Poll::Ready(Err(Error::Noise))
+                    } else if stat.aberr().bit_is_set() {
+                        Poll::Ready(Err(Error::Fail))
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await;
 
-                match res {
-                    Either::First(()) | Either::Second(Ok(())) => (),
-                    Either::Second(Err(e)) => return Err(e),
-                }
+            match res {
+                Either::First(()) | Either::Second(Ok(())) => (),
+                Either::Second(Err(e)) => return Err(e),
             }
         }
 
-        Ok(buf.len())
+        Ok(orig_len)
     }
 }
 
@@ -1110,7 +1115,7 @@ impl<'a> Uart<'a, Async> {
                     buffer,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_overrun: AtomicBool::new(false),
+                    bb_overrun: false,
                 }),
             ),
         })
@@ -1222,7 +1227,7 @@ impl<'a> Uart<'a, Async> {
                     buffer,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_overrun: AtomicBool::new(false),
+                    bb_overrun: false,
                 }),
             ),
         })
