@@ -5,8 +5,8 @@ use core::marker::PhantomData;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use super::DESCRIPTORS;
-use crate::dma::DmaInfo;
 use crate::dma::transfer::{Direction, Mode, Transfer, TransferOptions};
+use crate::dma::{DmaInfo, PINGPONG_DESCRIPTORS};
 
 /// DMA channel
 pub struct Channel<'d> {
@@ -162,6 +162,81 @@ impl<'d> Channel<'d> {
         } else {
             descriptor.nxt_desc_link_addr = 0;
         }
+    }
+
+    /// Configure the DMA channel for ping-pong (double buffer) transfer
+    pub fn configure_channel_ping_pong(
+        &self,
+        dir: Direction,
+        srcbase: *const u32,
+        dstbase_a: *mut u32,
+        dstbase_b: *mut u32,
+        mem_len: usize,
+        options: TransferOptions,
+    ) {
+        debug_assert!(mem_len.is_multiple_of(options.width.byte_width()));
+
+        let xferwidth: usize = options.width.byte_width();
+        let xfercount = (mem_len / xferwidth) - 1;
+        let channel = self.info.ch_num;
+
+        // Configure for transfer type, no hardware triggering (we'll trigger via software), high priority
+        // SAFETY: unsafe due to .bits usage
+        self.info.regs.channel(channel).cfg().write(|w| unsafe {
+            if dir == Direction::MemoryToMemory {
+                w.periphreqen().clear_bit();
+            } else {
+                w.periphreqen().set_bit();
+            }
+            w.hwtrigen().clear_bit();
+            w.chpriority().bits(0)
+        });
+
+        // Enable the interrupt on this channel
+        self.info
+            .regs
+            .intenset0()
+            .write(|w| unsafe { w.inten().bits(1 << channel) });
+
+        // Mark configuration valid, clear trigger on complete, width is 1 byte, source & destination increments are width x 1 (1 byte)
+        // SAFETY: unsafe due to .bits usage
+        self.info.regs.channel(channel).xfercfg().write(|w| unsafe {
+            w.cfgvalid().set_bit();
+            // Descriptor is exhausted and we need to manually hit SWTRIG to trigger the next one.
+            w.clrtrig().set_bit();
+            w.reload().set_bit();
+            w.setinta().set_bit();
+            w.width().bits(options.width.into());
+            if dir == Direction::PeripheralToMemory {
+                w.srcinc().bits(0);
+            } else {
+                w.srcinc().bits(1);
+            }
+            if dir == Direction::MemoryToPeripheral {
+                w.dstinc().bits(0);
+            } else {
+                w.dstinc().bits(1);
+            }
+            w.xfercount().bits(xfercount as u16)
+        });
+
+        #[allow(clippy::indexing_slicing)]
+        let descriptor_a = unsafe { &mut DESCRIPTORS.list[channel] };
+        let descriptor_b = unsafe { &mut PINGPONG_DESCRIPTORS.list[channel] };
+
+        // Configure the channel descriptor
+        // NOTE: the DMA controller expects the memory buffer end address but peripheral address is actual
+        let xfer_cfg = self.info.regs.channel(channel).xfercfg().read();
+        descriptor_a.reserved = xfer_cfg.bits();
+        descriptor_b.reserved = xfer_cfg.bits();
+
+        descriptor_a.src_data_end_addr = srcbase as u32;
+        descriptor_a.dst_data_end_addr = dstbase_a as u32 + (xfercount * xferwidth) as u32;
+        descriptor_a.nxt_desc_link_addr = descriptor_b as *const _ as u32;
+
+        descriptor_b.src_data_end_addr = srcbase as u32;
+        descriptor_b.dst_data_end_addr = dstbase_b as u32 + (xfercount * xferwidth) as u32;
+        descriptor_b.nxt_desc_link_addr = descriptor_a as *const _ as u32;
     }
 
     /// Enable the DMA channel (only after configuring)

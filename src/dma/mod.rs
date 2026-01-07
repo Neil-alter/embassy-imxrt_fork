@@ -50,6 +50,16 @@ static mut DESCRIPTORS: DescriptorBlock = DescriptorBlock {
     }; DMA_CHANNEL_COUNT],
 };
 
+/// Ping-pong Reload Descriptros
+static mut PINGPONG_DESCRIPTORS: DescriptorBlock = DescriptorBlock {
+    list: [ChannelDescriptor {
+        reserved: 0,
+        src_data_end_addr: 0,
+        dst_data_end_addr: 0,
+        nxt_desc_link_addr: 0,
+    }; DMA_CHANNEL_COUNT],
+};
+
 /// DMA errors
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -242,5 +252,37 @@ impl Instance for NoDma {
 impl SealedInstance for NoDma {
     fn info() -> Option<DmaInfo> {
         None
+    }
+}
+
+pub async fn monitor_dma_uart_combined(dma_channel: usize, interval_ms: u64) {
+    let dma0 = unsafe { crate::pac::Dma0::steal() };
+    let usart4 = unsafe { &*crate::pac::Usart4::ptr() };
+
+    info!(
+        "[Debug UART Monitor] Starting DMA Channel {} + USART4 RX monitoring",
+        dma_channel
+    );
+
+    loop {
+        let is_busy = (dma0.busy0().read().bsy().bits() & (1 << dma_channel)) != 0;
+        let is_active = (dma0.active0().read().act().bits() & (1 << dma_channel)) != 0;
+        let is_enabled = (dma0.enableset0().read().ena().bits() & (1 << dma_channel)) != 0;
+        let xfercount = dma0.channel(dma_channel).xfercfg().read().xfercount().bits();
+
+        let uart_fifostat = usart4.fifostat().read();
+        let dmarx = usart4.fifocfg().read().dmarx().bit();
+        let rxfull = uart_fifostat.rxfull().bit();
+        let rxlvl = uart_fifostat.rxlvl().bits();
+        let rxerr = uart_fifostat.rxerr().bit();
+        let rxnoempty = uart_fifostat.rxnotempty().bit();
+        let rxidle = usart4.stat().read().rxidle().bit();
+
+        info!(
+            "[Debug UART Monitor] DMA CH {}: Busy: {}, Active: {}, Enabled: {}, XferCount: {} | USART4 RX: DMARX: {}, RXFULL: {}, RXLVL: {}, RXERR: {}, NotEmpty: {}, IDLE: {}",
+            dma_channel, is_busy, is_active, is_enabled, xfercount, dmarx, rxfull, rxlvl, rxerr, rxnoempty, rxidle
+        );
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(interval_ms)).await;
     }
 }

@@ -6,8 +6,6 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
-#[cfg(feature = "time")]
-use bbqueue::BBBuffer;
 use embassy_futures::select::{Either, select};
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -229,17 +227,17 @@ impl<'a> UartTx<'a, Blocking> {
 
 struct BufferConfig {
     #[cfg(feature = "time")]
-    buffer: &'static mut [u8],
+    buffer_a: &'static mut [u8],
     #[cfg(feature = "time")]
-    dma_last_pos: usize,
-    #[cfg(feature = "time")]
-    polling_rate: u64,
-    #[cfg(feature = "time")]
-    bb_prod: Option<bbqueue::Producer<'static, 2048>>,
-    #[cfg(feature = "time")]
-    bb_cons: Option<bbqueue::Consumer<'static, 2048>>,
-    #[cfg(feature = "time")]
-    bb_overrun: AtomicBool,
+    buffer_b: &'static mut [u8],
+    /// Which buffer DMA is currently filling (0=A, 1=B)
+    dma_fill_buffer_index: u8,
+    /// Which buffer CPU is currently consuming (0=A, 1=B)
+    cpu_consume_buffer_index: u8,
+    /// Buffer A has been filled by DMA and is ready for CPU to consume
+    buffer_a_ready: AtomicBool,
+    /// Buffer B has been filled by DMA and is ready for CPU to consume
+    buffer_b_ready: AtomicBool,
 }
 
 impl<'a, M: Mode> UartRx<'a, M> {
@@ -727,10 +725,10 @@ impl<'a> UartRx<'a, Async> {
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
-        polling_rate_us: u64,
+        buffer_a: &'static mut [u8],
+        buffer_b: &'static mut [u8],
     ) -> Result<Self> {
-        if buffer.len() > 1024 {
+        if buffer_a.len() > 1024 || buffer_b.len() > 1024 {
             return Err(Error::InvalidArgument);
         }
 
@@ -745,11 +743,12 @@ impl<'a> UartRx<'a, Async> {
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
         // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
+        rx_dma.configure_channel_ping_pong(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            buffer_a.as_mut_ptr() as *mut u32,
+            buffer_b.as_mut_ptr() as *mut u32,
+            buffer_a.len(),
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -759,18 +758,16 @@ impl<'a> UartRx<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self::new_inner::<T>(
             flexcomm,
             Some(rx_dma),
             Some(BufferConfig {
-                buffer,
-                dma_last_pos: 0,
-                polling_rate: polling_rate_us,
-                bb_prod: Some(bb_prod),
-                bb_cons: Some(bb_cons),
-                bb_overrun: AtomicBool::new(false),
+                buffer_a,
+                buffer_b,
+                dma_fill_buffer_index: 0,
+                cpu_consume_buffer_index: 0,
+                buffer_a_ready: AtomicBool::new(false),
+                buffer_b_ready: AtomicBool::new(false),
             }),
         ))
     }
@@ -864,123 +861,71 @@ impl<'a> UartRx<'a, Async> {
     }
 
     #[cfg(feature = "time")]
-    fn pump_data_into_bb(&mut self) {
-        // Half of the buffer size of BBBqueue
-        const CHUNK: usize = 1024;
-
-        let cfg = self._buffer_config.as_mut().unwrap();
-        let prod = cfg.bb_prod.as_mut().unwrap();
-
-        let dma_len = cfg.buffer.len();
-        let rx_dma = self._rx_dma.as_ref().unwrap();
-        let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
-        let current_pos = (dma_len - remaining_bytes) % dma_len;
-
-        if current_pos == cfg.dma_last_pos {
-            // no new data
-            return;
-        }
-        let produced = if current_pos > cfg.dma_last_pos {
-            current_pos - cfg.dma_last_pos
-        } else {
-            dma_len - cfg.dma_last_pos + current_pos
-        };
-
-        // Limit to CHUNK size to avoid write quicker than read from BBQueue,
-        // which would lead to data loss.
-        let to_produce = produced.min(CHUNK);
-        let mut g = match prod.grant_max_remaining(to_produce) {
-            Ok(g) => g,
-            Err(_) => {
-                // No space in BBQueue, this indicates that the reader is not keeping up.
-                cfg.bb_overrun.store(true, Ordering::Relaxed);
-                return;
-            }
-        };
-
-        // Copy data from DMA buffer to BBQueue
-        let n = g.len().min(to_produce);
-        let start = cfg.dma_last_pos;
-        let end = (start + n) % dma_len;
-        if start < end {
-            // straightforward copy
-            g[..n].copy_from_slice(&cfg.buffer[start..end]);
-        } else {
-            // rollover copy
-            let first = dma_len - start;
-            g[..first].copy_from_slice(&cfg.buffer[start..dma_len]);
-            g[first..n].copy_from_slice(&cfg.buffer[0..end]);
-        }
-
-        g.commit(n);
-        cfg.dma_last_pos = end;
-    }
-
-    #[cfg(feature = "time")]
     async fn read_buffered(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // Extract polling_rate before entering the loop to avoid borrow conflicts
-        let polling_rate = self._buffer_config.as_ref().unwrap().polling_rate;
-        // Bytes already read into buf
         let mut bytes_read = 0;
 
         while bytes_read < buf.len() {
-            // Try to pump data from DMA buffer into BBQueue
-            self.pump_data_into_bb();
+            // Check if the current consume buffer is ready
+            let cfg = self._buffer_config.as_ref().unwrap();
+            let consume_idx = cfg.cpu_consume_buffer_index;
+            let is_ready = if consume_idx == 0 {
+                cfg.buffer_a_ready.load(Ordering::Acquire)
+            } else {
+                cfg.buffer_b_ready.load(Ordering::Acquire)
+            };
 
-            // Overrun occurred - data loss detected
-            if self
-                ._buffer_config
-                .as_ref()
-                .unwrap()
-                .bb_overrun
-                .swap(false, Ordering::Relaxed)
-            {
-                // Clear the BBQueue and update the DMA index to current position
-                // to avoid reading stale data on subsequent read_buffered calls
+            if is_ready {
+                // Read data from the ready buffer
+                let cfg = self._buffer_config.as_ref().unwrap();
+                let src_buffer: &[u8] = if consume_idx == 0 { cfg.buffer_a } else { cfg.buffer_b };
+
+                // Copy data from completed DMA buffer to user buffer
+                let copy_len = (buf.len() - bytes_read).min(src_buffer.len());
+                buf[bytes_read..bytes_read + copy_len].copy_from_slice(&src_buffer[..copy_len]);
+                bytes_read += copy_len;
+
+                // Mark buffer as consumed
                 let cfg = self._buffer_config.as_mut().unwrap();
-                let cons = cfg.bb_cons.as_mut().unwrap();
-
-                // Drain all data from BBQueue
-                while let Ok(g) = cons.read() {
-                    let len = g.len();
-                    g.release(len);
+                if consume_idx == 0 {
+                    cfg.buffer_a_ready.store(false, Ordering::Release);
+                } else {
+                    cfg.buffer_b_ready.store(false, Ordering::Release);
                 }
 
-                // Update DMA index to current position to avoid read previous data next time
-                let dma_len = cfg.buffer.len();
+                // Switch to the next buffer for consumption
+                cfg.cpu_consume_buffer_index = 1 - consume_idx;
+
+                // Retrigger DMA so it can fill the consumed buffer again
                 let rx_dma = self._rx_dma.as_ref().unwrap();
-                let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
-                cfg.dma_last_pos = (dma_len - remaining_bytes) % dma_len;
-
-                return Err(Error::Overrun);
-            }
-
-            // Read from BBQueue
-            let cfg = self._buffer_config.as_mut().unwrap();
-            let cons = cfg.bb_cons.as_mut().unwrap();
-            while bytes_read < buf.len() {
-                // Read all available bytes
-                match cons.read() {
-                    Ok(g) => {
-                        let grant_len = g.len();
-                        let n = grant_len.min(buf.len() - bytes_read);
-                        buf[bytes_read..bytes_read + n].copy_from_slice(&g[..n]);
-
-                        // Release bytes back to the queue
-                        g.release(n);
-
-                        // Bytes read increment
-                        bytes_read += n;
-                    }
-                    // There is no more data available in BBQueue, break to wait for new data
-                    Err(_) => break,
-                };
-            }
-
-            // If we still need more data, wait for either new data via polling or error condition
-            if bytes_read < buf.len() {
+                rx_dma.trigger_channel();
+            } else {
+                // Wait for DMA to complete filling the current buffer
                 let res = select(
-                    embassy_time::Timer::after_micros(polling_rate),
+                    // Wait for DMA complete interrupt
+                    poll_fn(|cx| {
+                        let rx_dma = self._rx_dma.as_ref().unwrap();
+                        rx_dma.get_waker().register(cx.waker());
+
+                        // Check if DMA has completed, if not stay pending
+                        if !rx_dma.is_active() {
+                            let cfg = self._buffer_config.as_mut().unwrap();
+                            let filled_buffer = cfg.dma_fill_buffer_index;
+
+                            // Mark the filled buffer as ready
+                            if filled_buffer == 0 {
+                                cfg.buffer_a_ready.store(true, Ordering::Release);
+                            } else {
+                                cfg.buffer_b_ready.store(true, Ordering::Release);
+                            }
+
+                            // DMA will now fill the other buffer after SWTRIG
+                            cfg.dma_fill_buffer_index = 1 - filled_buffer;
+
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
                     // detect bus errors
                     poll_fn(|cx| {
                         self.info.waker.register(cx.waker());
@@ -1025,13 +970,21 @@ impl<'a> UartRx<'a, Async> {
                 .await;
 
                 match res {
-                    Either::First(()) | Either::Second(Ok(())) => (),
+                    Either::First(Ok(())) => {
+                        // DMA completed, loop back to read from the ready buffer
+                        continue;
+                    }
+                    Either::First(Err(e)) => return Err(e),
+                    Either::Second(Ok(())) => {
+                        // Should not happen, but continue anyway
+                        continue;
+                    }
                     Either::Second(Err(e)) => return Err(e),
                 }
             }
         }
 
-        Ok(buf.len())
+        Ok(bytes_read)
     }
 }
 
@@ -1067,7 +1020,7 @@ impl<'a> Uart<'a, Async> {
         })
     }
 
-    /// Create a new DMA enabled UART with Rx buffering enabled
+    /// Create a new DMA enabled UART with Rx buffering enabled using ping-pong DMA
     #[cfg(feature = "time")]
     pub fn new_async_with_buffer<T: Instance>(
         _inner: Peri<'a, T>,
@@ -1077,10 +1030,10 @@ impl<'a> Uart<'a, Async> {
         tx_dma: Peri<'a, impl TxDma<T>>,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
-        polling_rate_us: u64,
+        buffer_a: &'static mut [u8],
+        buffer_b: &'static mut [u8],
     ) -> Result<Self> {
-        if buffer.len() > 1024 {
+        if buffer_a.len() > 1024 || buffer_b.len() > 1024 {
             return Err(Error::InvalidArgument);
         }
 
@@ -1095,12 +1048,13 @@ impl<'a> Uart<'a, Async> {
 
         let flexcomm = Self::init::<T>(Some(tx.into()), Some(rx.into()), None, None, config)?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
-        // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
+        // Configure ping-pong DMA for continuous buffered reception
+        rx_dma.configure_channel_ping_pong(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            buffer_a.as_mut_ptr() as *mut u32,
+            buffer_b.as_mut_ptr() as *mut u32,
+            buffer_a.len(),
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1110,8 +1064,6 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self {
             info: T::info(),
             tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
@@ -1119,12 +1071,12 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
-                    dma_last_pos: 0,
-                    polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
-                    bb_overrun: AtomicBool::new(false),
+                    buffer_a,
+                    buffer_b,
+                    dma_fill_buffer_index: 0,
+                    cpu_consume_buffer_index: 0,
+                    buffer_a_ready: AtomicBool::new(false),
+                    buffer_b_ready: AtomicBool::new(false),
                 }),
             ),
         })
@@ -1170,7 +1122,7 @@ impl<'a> Uart<'a, Async> {
         })
     }
 
-    /// Create a new DMA enabled UART with hardware flow control (RTS/CTS) and Rx buffering enabled
+    /// Create a new DMA enabled UART with hardware flow control (RTS/CTS) and Rx buffering enabled using ping-pong DMA
     #[allow(clippy::too_many_arguments)]
     #[cfg(feature = "time")]
     pub fn new_async_with_rtscts_buffer<T: Instance>(
@@ -1183,10 +1135,10 @@ impl<'a> Uart<'a, Async> {
         tx_dma: Peri<'a, impl TxDma<T>>,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
-        polling_rate_us: u64,
+        buffer_a: &'static mut [u8],
+        buffer_b: &'static mut [u8],
     ) -> Result<Self> {
-        if buffer.len() > 1024 {
+        if buffer_a.len() > 1024 || buffer_b.len() > 1024 {
             return Err(Error::InvalidArgument);
         }
 
@@ -1211,12 +1163,13 @@ impl<'a> Uart<'a, Async> {
             config,
         )?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
-        // immediately configure and enable channel for circular buffered reception
-        rx_dma.configure_channel(
+        // Configure ping-pong DMA for continuous buffered reception
+        rx_dma.configure_channel_ping_pong(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            buffer_a.as_mut_ptr() as *mut u32,
+            buffer_b.as_mut_ptr() as *mut u32,
+            buffer_a.len(),
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1226,8 +1179,6 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self {
             info: T::info(),
             tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
@@ -1235,12 +1186,12 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
-                    dma_last_pos: 0,
-                    polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
-                    bb_overrun: AtomicBool::new(false),
+                    buffer_a,
+                    buffer_b,
+                    dma_fill_buffer_index: 0,
+                    cpu_consume_buffer_index: 0,
+                    buffer_a_ready: AtomicBool::new(false),
+                    buffer_b_ready: AtomicBool::new(false),
                 }),
             ),
         })
@@ -1517,8 +1468,6 @@ unsafe impl Send for Info {}
 trait SealedInstance {
     fn info() -> Info;
     fn waker() -> &'static AtomicWaker;
-    #[cfg(feature = "time")]
-    fn bb() -> &'static BBBuffer<2048>;
 }
 
 /// UART interrupt handler.
@@ -1583,12 +1532,6 @@ macro_rules! impl_instance {
                     fn waker() -> &'static AtomicWaker {
                         static WAKER: AtomicWaker = AtomicWaker::new();
                         &WAKER
-                    }
-
-                    #[cfg(feature = "time")]
-                    fn bb() -> &'static BBBuffer<2048> {
-                        static BB: BBBuffer<2048> = BBBuffer::new();
-                        &BB
                     }
                 }
 
