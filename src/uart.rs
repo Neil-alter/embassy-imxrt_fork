@@ -346,6 +346,8 @@ impl<'a, M: Mode> Uart<'a, M> {
 
             regs.fifotrig()
                 .modify(|_, w| unsafe { w.rxlvl().bits(0) }.rxlvlena().set_bit());
+            regs.fifointenset()
+                .write(|w| w.rxlvl().set_bit());
 
             // clear FIFO error
             regs.fifostat().write(|w| w.rxerr().set_bit());
@@ -1018,6 +1020,9 @@ impl<'a> UartRx<'a, Async> {
                 poll_fn(|cx| {
                     info.waker.register(cx.waker());
 
+                    info.regs.fifointenset().write(|w| {
+                        w.rxlvl().set_bit()
+                    });
                     info.regs.intenset().write(|w| {
                         w.framerren()
                             .set_bit()
@@ -1144,6 +1149,11 @@ impl<'a> Uart<'a, Async> {
         );
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
+
+        T::Interrupt::unpend();
+        unsafe {
+            T::Interrupt::enable();
+        }
 
         Ok(Self {
             info: T::info(),
