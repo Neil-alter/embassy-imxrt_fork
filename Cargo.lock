@@ -24,10 +24,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbqueue"
-version = "0.5.1"
+name = "bbq2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd3baa8859d1a4c7411039a75c0599a4640ef1c9a8fc811e4325b00e6cfe0a55"
+checksum = "3a71c275de2904ad7132c0b6ccfd5d6276c9c1b6618b049b90cbffee98a1796d"
+dependencies = [
+ "const-init",
+ "critical-section",
+]
 
 [[package]]
 name = "bitfield"
@@ -73,6 +77,12 @@ checksum = "1a7964611d71df112cb1730f2ee67324fcf4d0fc6606acbbe9bfe06df124637c"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "const-init"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bd422bfb4f24a97243f60b6a4443e63d810c925d8da4bb2d8fde26a7c1d57ec"
 
 [[package]]
 name = "cortex-m"
@@ -280,7 +290,7 @@ dependencies = [
 name = "embassy-imxrt"
 version = "0.1.0"
 dependencies = [
- "bbqueue",
+ "bbq2",
  "cfg-if",
  "chrono",
  "cortex-m",

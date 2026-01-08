@@ -3,11 +3,11 @@
 use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 #[cfg(feature = "time")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::ptr::NonNull;
 use core::task::Poll;
 
 #[cfg(feature = "time")]
-use bbqueue::BBBuffer;
+use bbq2::nicknames::Churrasco;
 use embassy_futures::select::{Either, select};
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -227,19 +227,16 @@ impl<'a> UartTx<'a, Blocking> {
     }
 }
 
+#[cfg(not(feature = "time"))]
+struct BufferConfig {}
+
+#[cfg(feature = "time")]
 struct BufferConfig {
-    #[cfg(feature = "time")]
-    buffer: &'static mut [u8],
-    #[cfg(feature = "time")]
+    buffer_ptr: NonNull<u8>,
+    buffer_len: usize,
     dma_last_pos: usize,
-    #[cfg(feature = "time")]
     polling_rate: u64,
-    #[cfg(feature = "time")]
-    bb_prod: Option<bbqueue::Producer<'static, 2048>>,
-    #[cfg(feature = "time")]
-    bb_cons: Option<bbqueue::Consumer<'static, 2048>>,
-    #[cfg(feature = "time")]
-    bb_overrun: AtomicBool,
+    bb_overrun: bool,
 }
 
 impl<'a, M: Mode> UartRx<'a, M> {
@@ -349,6 +346,8 @@ impl<'a, M: Mode> Uart<'a, M> {
 
             regs.fifotrig()
                 .modify(|_, w| unsafe { w.rxlvl().bits(0) }.rxlvlena().set_bit());
+            regs.fifointenset()
+                .write(|w| w.rxlvl().set_bit());
 
             // clear FIFO error
             regs.fifostat().write(|w| w.rxerr().set_bit());
@@ -695,6 +694,13 @@ impl<'a> UartTx<'a, Async> {
     }
 }
 
+#[cfg(feature = "time")]
+fn to_nn_len(buffer: &'static mut [u8]) -> (NonNull<u8>, usize) {
+    let buffer_ptr = unsafe { NonNull::new_unchecked(buffer.as_mut_ptr()) };
+    let buffer_len = buffer.len();
+    (buffer_ptr, buffer_len)
+}
+
 impl<'a> UartRx<'a, Async> {
     /// Create a new DMA enabled UART which can only receive data
     pub fn new_async<T: Instance>(
@@ -742,14 +748,17 @@ impl<'a> UartRx<'a, Async> {
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
         // immediately configure and enable channel for circular buffered reception
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does this need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -759,18 +768,15 @@ impl<'a> UartRx<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self::new_inner::<T>(
             flexcomm,
             Some(rx_dma),
             Some(BufferConfig {
-                buffer,
+                buffer_ptr,
+                buffer_len,
                 dma_last_pos: 0,
                 polling_rate: polling_rate_us,
-                bb_prod: Some(bb_prod),
-                bb_cons: Some(bb_cons),
-                bb_overrun: AtomicBool::new(false),
+                bb_overrun: false,
             }),
         ))
     }
@@ -864,16 +870,15 @@ impl<'a> UartRx<'a, Async> {
     }
 
     #[cfg(feature = "time")]
-    fn pump_data_into_bb(&mut self) {
+    fn pump_data_into_bb(cfg: &mut BufferConfig, info: &mut Info, rx_dma: &mut Channel<'_>) {
         // Half of the buffer size of BBBqueue
         const CHUNK: usize = 1024;
 
-        let cfg = self._buffer_config.as_mut().unwrap();
-        let prod = cfg.bb_prod.as_mut().unwrap();
+        let prod = info.bb.stream_producer();
+        let dma_len = cfg.buffer_len;
 
-        let dma_len = cfg.buffer.len();
-        let rx_dma = self._rx_dma.as_ref().unwrap();
         let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
         let current_pos = (dma_len - remaining_bytes) % dma_len;
 
         if current_pos == cfg.dma_last_pos {
@@ -893,7 +898,7 @@ impl<'a> UartRx<'a, Async> {
             Ok(g) => g,
             Err(_) => {
                 // No space in BBQueue, this indicates that the reader is not keeping up.
-                cfg.bb_overrun.store(true, Ordering::Relaxed);
+                cfg.bb_overrun = true;
                 return;
             }
         };
@@ -904,12 +909,34 @@ impl<'a> UartRx<'a, Async> {
         let end = (start + n) % dma_len;
         if start < end {
             // straightforward copy
-            g[..n].copy_from_slice(&cfg.buffer[start..end]);
+            // TODO(AJM): This is not really fully sound. There is no guard that access from DMA is not
+            // aliasing at any point. By using a NN ptr (instead of a slice), and by using a compiler
+            // fence AFTER we read the number of bytes available in the DMA transfer, we hope to ideally
+            // prevent miscompilations, and avoid racing reads.
+            unsafe {
+                let dma_start_ptr = cfg.buffer_ptr.add(start).as_ptr();
+                let grant_start_ptr = g.as_mut_ptr();
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, n);
+            }
         } else {
             // rollover copy
             let first = dma_len - start;
-            g[..first].copy_from_slice(&cfg.buffer[start..dma_len]);
-            g[first..n].copy_from_slice(&cfg.buffer[0..end]);
+
+            // TODO(AJM): This is not really fully sound. There is no guard that access from DMA is not
+            // aliasing at any point. By using a NN ptr (instead of a slice), and by using a compiler
+            // fence AFTER we read the number of bytes available in the DMA transfer, we hope to ideally
+            // prevent miscompilations, and avoid racing reads.
+            unsafe {
+                // g[..first].copy_from_slice(&cfg.buffer[start..dma_len]);
+                let dma_start_ptr = cfg.buffer_ptr.add(start).as_ptr();
+                let grant_start_ptr = g.as_mut_ptr();
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, first);
+
+                // g[first..n].copy_from_slice(&cfg.buffer[0..end]);
+                let dma_start_ptr = cfg.buffer_ptr.as_ptr();
+                let grant_start_ptr = g.as_mut_ptr().add(first);
+                core::ptr::copy_nonoverlapping(dma_start_ptr, grant_start_ptr, end);
+            }
         }
 
         g.commit(n);
@@ -919,27 +946,36 @@ impl<'a> UartRx<'a, Async> {
     #[cfg(feature = "time")]
     async fn read_buffered(&mut self, buf: &mut [u8]) -> Result<usize> {
         // Extract polling_rate before entering the loop to avoid borrow conflicts
-        let polling_rate = self._buffer_config.as_ref().unwrap().polling_rate;
-        // Bytes already read into buf
-        let mut bytes_read = 0;
+        let orig_len = buf.len();
+        let mut window = buf;
+        let Self {
+            info,
+            _flexcomm,
+            _buffer_config,
+            _rx_dma,
+            _phantom,
+        } = self;
 
-        while bytes_read < buf.len() {
+        // We should always have a buffer config and rx_dma if we are reading buffered.
+        let Some(cfg) = _buffer_config.as_mut() else {
+            return Err(Error::Fail);
+        };
+        let Some(rx_dma) = _rx_dma.as_mut() else {
+            return Err(Error::Fail);
+        };
+        let cons = info.bb.stream_consumer();
+        let polling_rate = cfg.polling_rate;
+
+        while !window.is_empty() {
             // Try to pump data from DMA buffer into BBQueue
-            self.pump_data_into_bb();
+            Self::pump_data_into_bb(cfg, info, rx_dma);
 
             // Overrun occurred - data loss detected
-            if self
-                ._buffer_config
-                .as_ref()
-                .unwrap()
-                .bb_overrun
-                .swap(false, Ordering::Relaxed)
-            {
+            if cfg.bb_overrun {
+                cfg.bb_overrun = false;
                 // Clear the BBQueue and update the DMA index to current position
                 // to avoid reading stale data on subsequent read_buffered calls
-                let cfg = self._buffer_config.as_mut().unwrap();
-                let cons = cfg.bb_cons.as_mut().unwrap();
-
+                //
                 // Drain all data from BBQueue
                 while let Ok(g) = cons.read() {
                     let len = g.len();
@@ -947,8 +983,8 @@ impl<'a> UartRx<'a, Async> {
                 }
 
                 // Update DMA index to current position to avoid read previous data next time
-                let dma_len = cfg.buffer.len();
-                let rx_dma = self._rx_dma.as_ref().unwrap();
+                let dma_len = cfg.buffer_len;
+                let rx_dma = _rx_dma.as_ref().unwrap();
                 let remaining_bytes = rx_dma.get_xfer_count() as usize + 1;
                 cfg.dma_last_pos = (dma_len - remaining_bytes) % dma_len;
 
@@ -956,82 +992,83 @@ impl<'a> UartRx<'a, Async> {
             }
 
             // Read from BBQueue
-            let cfg = self._buffer_config.as_mut().unwrap();
-            let cons = cfg.bb_cons.as_mut().unwrap();
-            while bytes_read < buf.len() {
-                // Read all available bytes
-                match cons.read() {
-                    Ok(g) => {
-                        let grant_len = g.len();
-                        let n = grant_len.min(buf.len() - bytes_read);
-                        buf[bytes_read..bytes_read + n].copy_from_slice(&g[..n]);
+            //
+            // Read all available bytes. We only read one grant, to allow us to go back and
+            // pump more data from the bbqueue ASAP if required to avoid overruns
+            if let Ok(g) = cons.read() {
+                let grant_len = g.len();
+                let n = grant_len.min(window.len());
+                let (now, later) = window.split_at_mut(n);
 
-                        // Release bytes back to the queue
-                        g.release(n);
+                now.copy_from_slice(&g[..n]);
 
-                        // Bytes read increment
-                        bytes_read += n;
-                    }
-                    // There is no more data available in BBQueue, break to wait for new data
-                    Err(_) => break,
-                };
-            }
+                // Release bytes back to the queue
+                g.release(n);
+
+                // If we're done, break!
+                if later.is_empty() {
+                    break;
+                }
+
+                window = later;
+            };
 
             // If we still need more data, wait for either new data via polling or error condition
-            if bytes_read < buf.len() {
-                let res = select(
-                    embassy_time::Timer::after_micros(polling_rate),
-                    // detect bus errors
-                    poll_fn(|cx| {
-                        self.info.waker.register(cx.waker());
+            let res = select(
+                embassy_time::Timer::after_micros(polling_rate),
+                // detect bus errors
+                poll_fn(|cx| {
+                    info.waker.register(cx.waker());
 
-                        self.info.regs.intenset().write(|w| {
-                            w.framerren()
-                                .set_bit()
-                                .parityerren()
-                                .set_bit()
-                                .rxnoiseen()
-                                .set_bit()
-                                .aberren()
-                                .set_bit()
-                        });
+                    info.regs.fifointenset().write(|w| {
+                        w.rxlvl().set_bit()
+                    });
+                    info.regs.intenset().write(|w| {
+                        w.framerren()
+                            .set_bit()
+                            .parityerren()
+                            .set_bit()
+                            .rxnoiseen()
+                            .set_bit()
+                            .aberren()
+                            .set_bit()
+                    });
 
-                        let stat = self.info.regs.stat().read();
+                    let stat = info.regs.stat().read();
 
-                        self.info.regs.stat().write(|w| {
-                            w.framerrint()
-                                .clear_bit_by_one()
-                                .parityerrint()
-                                .clear_bit_by_one()
-                                .rxnoiseint()
-                                .clear_bit_by_one()
-                                .aberr()
-                                .clear_bit_by_one()
-                        });
+                    info.regs.stat().write(|w| {
+                        w.framerrint()
+                            .clear_bit_by_one()
+                            .parityerrint()
+                            .clear_bit_by_one()
+                            .rxnoiseint()
+                            .clear_bit_by_one()
+                            .aberr()
+                            .clear_bit_by_one()
+                    });
 
-                        if stat.framerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Framing))
-                        } else if stat.parityerrint().bit_is_set() {
-                            Poll::Ready(Err(Error::Parity))
-                        } else if stat.rxnoiseint().bit_is_set() {
-                            Poll::Ready(Err(Error::Noise))
-                        } else if stat.aberr().bit_is_set() {
-                            Poll::Ready(Err(Error::Fail))
-                        } else {
-                            Poll::Pending
-                        }
-                    }),
-                )
-                .await;
+                    if stat.framerrint().bit_is_set() {
+                        Poll::Ready(Err(Error::Framing))
+                    } else if stat.parityerrint().bit_is_set() {
+                        Poll::Ready(Err(Error::Parity))
+                    } else if stat.rxnoiseint().bit_is_set() {
+                        Poll::Ready(Err(Error::Noise))
+                    } else if stat.aberr().bit_is_set() {
+                        Poll::Ready(Err(Error::Fail))
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await;
 
-                match res {
-                    Either::First(()) | Either::Second(Ok(())) => (),
-                    Either::Second(Err(e)) => return Err(e),
-                }
+            match res {
+                Either::First(()) | Either::Second(Ok(())) => (),
+                Either::Second(Err(e)) => return Err(e),
             }
         }
 
-        Ok(buf.len())
+        Ok(orig_len)
     }
 }
 
@@ -1090,6 +1127,8 @@ impl<'a> Uart<'a, Async> {
         let tx = tx.into();
         let rx = rx.into();
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
 
@@ -1099,8 +1138,9 @@ impl<'a> Uart<'a, Async> {
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does our buffer need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1110,7 +1150,10 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
+        T::Interrupt::unpend();
+        unsafe {
+            T::Interrupt::enable();
+        }
 
         Ok(Self {
             info: T::info(),
@@ -1119,12 +1162,11 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
+                    buffer_ptr,
+                    buffer_len,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
-                    bb_overrun: AtomicBool::new(false),
+                    bb_overrun: false,
                 }),
             ),
         })
@@ -1203,6 +1245,8 @@ impl<'a> Uart<'a, Async> {
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::InvalidArgument)?;
 
+        let (buffer_ptr, buffer_len) = to_nn_len(buffer);
+
         let flexcomm = Self::init::<T>(
             Some(tx.into()),
             Some(rx.into()),
@@ -1215,8 +1259,9 @@ impl<'a> Uart<'a, Async> {
         rx_dma.configure_channel(
             dma::transfer::Direction::PeripheralToMemory,
             T::info().regs.fiford().as_ptr() as *const u8 as *const u32,
-            buffer as *mut [u8] as *mut u32,
-            buffer.len(),
+            // TODO(AJM): Does this need to be 4-byte aligned?
+            buffer_ptr.as_ptr().cast::<u32>(),
+            buffer_len,
             dma::transfer::TransferOptions {
                 width: dma::transfer::Width::Bit8,
                 priority: dma::transfer::Priority::Priority0,
@@ -1226,8 +1271,6 @@ impl<'a> Uart<'a, Async> {
         rx_dma.enable_channel();
         rx_dma.trigger_channel();
 
-        let (bb_prod, bb_cons) = T::bb().try_split().unwrap();
-
         Ok(Self {
             info: T::info(),
             tx: UartTx::new_inner::<T>(flexcomm.clone(), tx_dma),
@@ -1235,12 +1278,11 @@ impl<'a> Uart<'a, Async> {
                 flexcomm,
                 Some(rx_dma),
                 Some(BufferConfig {
-                    buffer,
+                    buffer_ptr,
+                    buffer_len,
                     dma_last_pos: 0,
                     polling_rate: polling_rate_us,
-                    bb_prod: Some(bb_prod),
-                    bb_cons: Some(bb_cons),
-                    bb_overrun: AtomicBool::new(false),
+                    bb_overrun: false,
                 }),
             ),
         })
@@ -1507,6 +1549,8 @@ impl embedded_io_async::Write for Uart<'_, Async> {
 struct Info {
     regs: &'static crate::pac::usart0::RegisterBlock,
     waker: &'static AtomicWaker,
+    #[cfg(feature = "time")]
+    bb: &'static Churrasco<2048>,
 }
 
 // SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
@@ -1518,7 +1562,7 @@ trait SealedInstance {
     fn info() -> Info;
     fn waker() -> &'static AtomicWaker;
     #[cfg(feature = "time")]
-    fn bb() -> &'static BBBuffer<2048>;
+    fn bb() -> &'static Churrasco<2048>;
 }
 
 /// UART interrupt handler.
@@ -1577,6 +1621,8 @@ macro_rules! impl_instance {
                         Info {
                             regs: unsafe { &*crate::pac::[<Usart $n>]::ptr() },
                             waker: Self::waker(),
+                            #[cfg(feature = "time")]
+                            bb: Self::bb(),
                         }
                     }
 
@@ -1586,8 +1632,8 @@ macro_rules! impl_instance {
                     }
 
                     #[cfg(feature = "time")]
-                    fn bb() -> &'static BBBuffer<2048> {
-                        static BB: BBBuffer<2048> = BBBuffer::new();
+                    fn bb() -> &'static Churrasco<2048> {
+                        static BB: Churrasco<2048> = Churrasco::new();
                         &BB
                     }
                 }
