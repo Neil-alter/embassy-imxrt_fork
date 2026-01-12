@@ -226,11 +226,11 @@ struct BufferConfig {
     #[cfg(feature = "time")]
     buf_b: &'static mut [u8], // Pong buffer
     #[cfg(feature = "time")]
-    read_buf: u8, // What buffer is being read from (0: A, 1: B)
-    #[cfg(feature = "time")]
     read_off: usize, // Offset of the buffer
     #[cfg(feature = "time")]
     polling_rate: u64,
+    #[cfg(feature = "time")]
+    current_buffer: dma::PingPongSelector,
 }
 
 impl<'a, M: Mode> UartRx<'a, M> {
@@ -717,13 +717,14 @@ impl<'a> UartRx<'a, Async> {
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
+        buf_a: &'static mut [u8],
+        buf_b: &'static mut [u8],
         polling_rate_us: u64,
     ) -> Result<Self> {
         // 2 x 1024 for ping-pong buffer
-        if buffer.len() > 2048 {
+        /*if buffer.len() > 2048 {
             return Err(Error::InvalidArgument);
-        }
+        }*/
 
         rx.as_rx();
 
@@ -734,7 +735,7 @@ impl<'a> UartRx<'a, Async> {
         unsafe { T::Interrupt::enable() };
 
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
-        let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
+        // let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
 
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
         // immediately configure and enable channel for circular buffered reception
@@ -758,9 +759,9 @@ impl<'a> UartRx<'a, Async> {
             Some(BufferConfig {
                 buf_a,
                 buf_b,
-                read_buf: 0,
                 read_off: 0,
                 polling_rate: polling_rate_us,
+                current_buffer: dma::PingPongSelector::BufferA,
             }),
         ))
     }
@@ -858,7 +859,6 @@ impl<'a> UartRx<'a, Async> {
         // unwrap safe here as only entry path to API requires rx_dma instance
         let rx_dma = self._rx_dma.as_ref().unwrap();
         let buffer_config = self._buffer_config.as_mut().unwrap();
-        let ch_num = rx_dma.get_channel_number();
 
         let half_size = buffer_config.buf_a.len();
 
@@ -867,88 +867,86 @@ impl<'a> UartRx<'a, Async> {
 
         // As the Rx Idle interrupt is not present for this processor, we must poll to see if new data is available
         while bytes_read < buf.len() {
-            let active_desc = dma::pp_get_dma_desc(ch_num); // 0: A, 1: B
-            let dma_waiting = dma::pp_is_dma_waiting(ch_num); // DMA is blocked, we cannot use xfercount to determine write position
+            // Check if current buffer has been granted (filled by DMA)
+            let cur_buf = buffer_config.current_buffer;
+            let buffer_status = rx_dma.buffer_status(cur_buf);
 
-            let cur_buf = buffer_config.read_buf;
             let mut available = 0usize;
 
-            if cur_buf == 0 {
-                // reading from buf_a
-                if active_desc == 0 && !dma_waiting {
-                    // DMA is writing to buf_a, use xfercount to determine write position
-                    let remaining = rx_dma.get_xfer_count() as usize + 1;
-                    if remaining <= half_size {
-                        let written = half_size - remaining;
-                        if written > buffer_config.read_off {
-                            available = written - buffer_config.read_off;
-                        }
-                    }
-                } else {
-                    // DMA is not writing to buf_a, all data in buf_a is available to read
-                    if dma::pp_buf_a_has_data(ch_num) {
-                        if buffer_config.read_off < half_size {
-                            available = half_size - buffer_config.read_off;
-                        }
-                    }
-                }
+            if buffer_status == dma::BufferConsumeStatus::Granted {
+                // Current buffer is equal to the granted buffer
+                // The entire buffer is available to read
+                available = half_size - buffer_config.read_off;
             } else {
-                // reading from buf_b
-                if active_desc == 1 && !dma_waiting {
-                    // DMA is writing to buf_b, use xfercount to determine write position
+                // Buffer not yet granted - check if DMA is writing to it
+                // We can try to read partial data using xfercount
+                let dma_current_buffer = rx_dma.current_buffer();
+                if dma_current_buffer == cur_buf {
+                    // DMA is writing to the current buffer, try to read partial data
                     let remaining = rx_dma.get_xfer_count() as usize + 1;
-                    if remaining <= half_size {
+
+                    // Double-check: make sure DMA is still writing to the current buffer
+                    // If buffer switch during check, available data stays 0, we'll retry next iteration
+                    if rx_dma.current_buffer() == cur_buf && remaining <= half_size {
                         let written = half_size - remaining;
                         if written > buffer_config.read_off {
                             available = written - buffer_config.read_off;
                         }
                     }
                 } else {
-                    // DMA is not writing to buf_b, all data in buf_b is available to read
-                    if dma::pp_buf_b_has_data(ch_num) {
-                        if buffer_config.read_off < half_size {
-                            available = half_size - buffer_config.read_off;
-                        }
+                    // DMA is on other buffer, recheck if current buffer is now granted
+                    // (ISR may have run between our first check and now)
+                    let buffer_check = rx_dma.buffer_status(cur_buf);
+                    if buffer_check == dma::BufferConsumeStatus::Granted {
+                        // Current buffer is equal to the granted buffer
+                        // The entire buffer is available to read
+                        available = half_size - buffer_config.read_off;
                     }
+                    // else: still not granted, no data available
                 }
             }
 
             if available > 0 {
                 let want_to_read = buf.len() - bytes_read;
-                // Copy data from the last read position up to the write position
                 let to_read = want_to_read.min(available);
 
                 // Read data from the appropriate buffer
-                if cur_buf == 0 {
-                    buf[bytes_read..bytes_read + to_read].copy_from_slice(
-                        &buffer_config.buf_a[buffer_config.read_off..buffer_config.read_off + to_read],
-                    );
-                } else {
-                    buf[bytes_read..bytes_read + to_read].copy_from_slice(
-                        &buffer_config.buf_b[buffer_config.read_off..buffer_config.read_off + to_read],
-                    );
+                match cur_buf {
+                    dma::PingPongSelector::BufferA => {
+                        buf[bytes_read..bytes_read + to_read].copy_from_slice(
+                            &buffer_config.buf_a[buffer_config.read_off..buffer_config.read_off + to_read],
+                        );
+                    }
+                    dma::PingPongSelector::BufferB => {
+                        buf[bytes_read..bytes_read + to_read].copy_from_slice(
+                            &buffer_config.buf_b[buffer_config.read_off..buffer_config.read_off + to_read],
+                        );
+                    }
                 }
 
+                // Update counters
                 bytes_read += to_read;
                 buffer_config.read_off += to_read;
+                info!(
+                    "buf: {:?}, bytes_read: {}, read_off: {}",
+                    buf, bytes_read, buffer_config.read_off
+                );
 
-                // The whole half buffer has been read, switch buffers
+                // The whole half buffer has been read, switch to next buffer
                 if buffer_config.read_off == half_size {
                     buffer_config.read_off = 0;
-                    if cur_buf == 0 {
-                        dma::pp_clear_buf_a_has_data(ch_num);
-                    } else {
-                        dma::pp_clear_buf_b_has_data(ch_num);
-                    }
+                    unsafe { rx_dma.commit_buffer(cur_buf) };
 
-                    // Switch to the other buffer
-                    buffer_config.read_buf ^= 1;
-
-                    // DMA may be waiting for us to re-trigger it after finishing the other buffer
-                    if dma::pp_is_dma_waiting(ch_num) {
-                        dma::pp_clear_dma_waiting(ch_num);
-                        rx_dma.trigger_channel();
-                    }
+                    buffer_config.current_buffer = match cur_buf {
+                        dma::PingPongSelector::BufferA => {
+                            info!("Finishing Consuming A, Committing buffer A, Start to consume buffer B");
+                            dma::PingPongSelector::BufferB
+                        }
+                        dma::PingPongSelector::BufferB => {
+                            info!("Finishing Consuming B, Committing buffer B, Start to consume buffer A");
+                            dma::PingPongSelector::BufferA
+                        }
+                    };
                 }
             } else {
                 // No data available, wait for either new data or polling timeout
@@ -1049,13 +1047,14 @@ impl<'a> Uart<'a, Async> {
         tx_dma: Peri<'a, impl TxDma<T>>,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
+        buf_a: &'static mut [u8],
+        buf_b: &'static mut [u8],
         polling_rate_us: u64,
     ) -> Result<Self> {
         // 2 x 1024 for ping-pong buffer
-        if buffer.len() > 2048 {
+        /*if buffer.len() > 2048 {
             return Err(Error::InvalidArgument);
-        }
+        }*/
 
         tx.as_tx();
         rx.as_rx();
@@ -1065,7 +1064,7 @@ impl<'a> Uart<'a, Async> {
 
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma: Channel<'_> = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
-        let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
+        // let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
 
         let flexcomm = Self::init::<T>(Some(tx.into()), Some(rx.into()), None, None, config)?;
         T::info().regs.fifocfg().modify(|_, w| w.dmarx().enabled());
@@ -1093,14 +1092,13 @@ impl<'a> Uart<'a, Async> {
                 Some(BufferConfig {
                     buf_a,
                     buf_b,
-                    read_buf: 0,
                     read_off: 0,
                     polling_rate: polling_rate_us,
+                    current_buffer: dma::PingPongSelector::BufferA,
                 }),
             ),
         })
     }
-
     /// Create a new DMA enabled UART with hardware flow control (RTS/CTS)
     pub fn new_with_rtscts<T: Instance>(
         _inner: Peri<'a, T>,
@@ -1154,13 +1152,14 @@ impl<'a> Uart<'a, Async> {
         tx_dma: Peri<'a, impl TxDma<T>>,
         rx_dma: Peri<'a, impl RxDma<T>>,
         config: Config,
-        buffer: &'static mut [u8],
+        buf_a: &'static mut [u8],
+        buf_b: &'static mut [u8],
         polling_rate_us: u64,
     ) -> Result<Self> {
         // 2 x 1024 for ping-pong buffer
-        if buffer.len() > 2048 {
+        /*if buffer.len() > 2048 {
             return Err(Error::InvalidArgument);
-        }
+        }*/
 
         tx.as_tx();
         rx.as_rx();
@@ -1174,7 +1173,7 @@ impl<'a> Uart<'a, Async> {
 
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::InvalidArgument)?;
-        let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
+        // let (buf_a, buf_b) = buffer.split_at_mut(buffer.len() / 2);
 
         let flexcomm = Self::init::<T>(
             Some(tx.into()),
@@ -1208,9 +1207,9 @@ impl<'a> Uart<'a, Async> {
                 Some(BufferConfig {
                     buf_a,
                     buf_b,
-                    read_buf: 0,
                     read_off: 0,
                     polling_rate: polling_rate_us,
+                    current_buffer: dma::PingPongSelector::BufferA,
                 }),
             ),
         })

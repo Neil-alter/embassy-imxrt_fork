@@ -5,7 +5,7 @@ pub mod transfer;
 
 use core::marker::PhantomData;
 use core::ptr;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_hal_internal::impl_peripheral;
 use embassy_hal_internal::interrupt::InterruptExt;
@@ -23,87 +23,6 @@ use crate::{Peri, PeripheralType, interrupt};
 //  - locking on common dma register configuration
 
 const DMA_CHANNEL_COUNT: usize = 33;
-
-// ==== Ping-pong status flags (internal use only) ====
-const PP_DMA_DESC: u8 = 0b0000_0001; // Bit 0: DMA Descriptor in use (0=A, 1=B)
-const PP_BUF_A_HAS_DATA: u8 = 0b0000_0010; // Bit 1: Buffer A full of data not yet consumed
-const PP_BUF_B_HAS_DATA: u8 = 0b0000_0100; // Bit 2: Buffer B full of data not yet consumed
-const PP_DMA_WAITING: u8 = 0b0000_1000; // Bit 3: DMA is waiting to be triggered
-
-// Ping-pong registration mask
-static PINGPONG_CH_MASK: AtomicU32 = AtomicU32::new(0);
-
-// Ping-pong per-channel state bitfield
-static PINGPONG_STATE: [AtomicU8; DMA_CHANNEL_COUNT] = [const { AtomicU8::new(0) }; DMA_CHANNEL_COUNT];
-
-/// Register a channel for ping-pong transfers
-pub fn pp_register_channel(ch: usize) {
-    PINGPONG_CH_MASK.fetch_or(1 << ch, Ordering::Relaxed);
-
-    // Initialize channel state
-    PINGPONG_STATE[ch].store(0, Ordering::Relaxed);
-}
-
-// Check if a channel is registered for ping-pong transfers
-fn pp_is_registered(ch: usize) -> bool {
-    (PINGPONG_CH_MASK.load(Ordering::Relaxed) & (1 << ch)) != 0
-}
-
-/// Get the current DMA descriptor in use for a ping-pong channel
-pub fn pp_get_dma_desc(ch: usize) -> u8 {
-    PINGPONG_STATE[ch].load(Ordering::Relaxed) & PP_DMA_DESC
-}
-
-/// Mark the DMA descriptor A has data not yet consumed
-pub fn pp_set_buf_a_has_data(ch: usize) {
-    PINGPONG_STATE[ch].fetch_or(PP_BUF_A_HAS_DATA, Ordering::Relaxed);
-}
-
-/// Mark the DMA descriptor B has data not yet consumed for a ping-pong channel
-pub fn pp_set_buf_b_has_data(ch: usize) {
-    PINGPONG_STATE[ch].fetch_or(PP_BUF_B_HAS_DATA, Ordering::Relaxed);
-}
-
-/// Clear Buffer A has data flag
-pub fn pp_clear_buf_a_has_data(ch: usize) {
-    PINGPONG_STATE[ch].fetch_and(!PP_BUF_A_HAS_DATA, Ordering::Relaxed);
-}
-
-/// Clear Buffer B has data flag
-pub fn pp_clear_buf_b_has_data(ch: usize) {
-    PINGPONG_STATE[ch].fetch_and(!PP_BUF_B_HAS_DATA, Ordering::Relaxed);
-}
-
-/// Check if the ping-pong channel have data not yet consumed
-pub fn pp_buf_a_has_data(ch: usize) -> bool {
-    (PINGPONG_STATE[ch].load(Ordering::Relaxed) & PP_BUF_A_HAS_DATA) != 0
-}
-
-/// Check if the ping-pong channel have data not yet consumed
-pub fn pp_buf_b_has_data(ch: usize) -> bool {
-    (PINGPONG_STATE[ch].load(Ordering::Relaxed) & PP_BUF_B_HAS_DATA) != 0
-}
-
-/// Switch the DMA descriptor to the next one, return the new descriptor in use
-pub fn pp_switch_dma_desc(ch: usize) -> u8 {
-    let old_state = PINGPONG_STATE[ch].fetch_xor(PP_DMA_DESC, Ordering::Relaxed);
-    1 - (old_state & PP_DMA_DESC)
-}
-
-/// Set the DMA waiting flag
-pub fn pp_set_dma_waiting(ch: usize) {
-    PINGPONG_STATE[ch].fetch_or(PP_DMA_WAITING, Ordering::Relaxed);
-}
-
-/// Clear the DMA waiting flag
-pub fn pp_clear_dma_waiting(ch: usize) {
-    PINGPONG_STATE[ch].fetch_and(!PP_DMA_WAITING, Ordering::Relaxed);
-}
-
-/// Check if the DMA is waiting to be triggered
-pub fn pp_is_dma_waiting(ch: usize) -> bool {
-    (PINGPONG_STATE[ch].load(Ordering::Relaxed) & PP_DMA_WAITING) != 0
-}
 
 /// DMA channel descriptor
 #[derive(Copy, Clone, Debug)]
@@ -133,7 +52,7 @@ static mut DESCRIPTORS: DescriptorBlock = DescriptorBlock {
 };
 
 /// Ping-pong Reload Descriptros
-static mut PINGPONG_DESCRIPTORS: DescriptorBlock = DescriptorBlock {
+static mut PING_PONG_DESCRIPTORS: DescriptorBlock = DescriptorBlock {
     list: [ChannelDescriptor {
         reserved: 0,
         src_data_end_addr: 0,
@@ -141,6 +60,33 @@ static mut PINGPONG_DESCRIPTORS: DescriptorBlock = DescriptorBlock {
         nxt_desc_link_addr: 0,
     }; DMA_CHANNEL_COUNT],
 };
+
+/// Ping Pong buffer select
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PingPongSelector {
+    BufferA,
+    BufferB,
+}
+
+/// Ping Pong buffer select
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BufferConsumeStatus {
+    Committed,
+    Granted,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PingPongDescriptorStatus {
+    current: PingPongSelector,
+    buffer_a_status: BufferConsumeStatus,
+    buffer_b_status: BufferConsumeStatus,
+}
+
+static mut PING_PONG_STATUS: [PingPongDescriptorStatus; DMA_CHANNEL_COUNT] = [PingPongDescriptorStatus {
+    current: PingPongSelector::BufferA,
+    buffer_a_status: BufferConsumeStatus::Committed,
+    buffer_b_status: BufferConsumeStatus::Committed,
+}; DMA_CHANNEL_COUNT];
 
 /// DMA errors
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -158,6 +104,76 @@ static DMA_WAKERS: [AtomicWaker; DMA_CHANNEL_COUNT] = [const { AtomicWaker::new(
 #[allow(non_snake_case)]
 fn DMA0() {
     dma0_irq_handler(&DMA_WAKERS);
+}
+
+static IRQ_CNT: AtomicU32 = AtomicU32::new(0);
+static SWTRIG_CNT: AtomicU32 = AtomicU32::new(0);
+static OVERRUN_CNT: AtomicU32 = AtomicU32::new(0);
+
+pub async fn flag_monitor() {
+    let dma_channel = 2;
+    loop {
+        let descriptor_a = unsafe { &DESCRIPTORS.list[dma_channel] };
+        let descriptor_b = unsafe { &PING_PONG_DESCRIPTORS.list[dma_channel] };
+
+        info!(
+            "IRQ_CNT: {}, SWTRIG_CNT: {}, OVERRUN_CNT: {}",
+            IRQ_CNT.load(Ordering::Acquire),
+            SWTRIG_CNT.load(Ordering::Acquire),
+            OVERRUN_CNT.load(Ordering::Acquire)
+        );
+        info!(
+            "Desc_A @0x{:08X}: dst=0x{:08X}, src=0x{:08X}, nxt=0x{:08X}, rsv=0x{:08X}",
+            descriptor_a as *const _ as u32,
+            descriptor_a.dst_data_end_addr,
+            descriptor_a.src_data_end_addr,
+            descriptor_a.nxt_desc_link_addr,
+            descriptor_a.reserved
+        );
+        info!(
+            "Desc_B @0x{:08X}: dst=0x{:08X}, src=0x{:08X}, nxt=0x{:08X}, rsv=0x{:08X}",
+            descriptor_b as *const _ as u32,
+            descriptor_b.dst_data_end_addr,
+            descriptor_b.src_data_end_addr,
+            descriptor_b.nxt_desc_link_addr,
+            descriptor_b.reserved
+        );
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+    }
+}
+
+pub async fn monitor_dma_uart_combined(interval_ms: u64) {
+    let dma0 = unsafe { crate::pac::Dma0::steal() };
+    let usart1 = unsafe { &*crate::pac::Usart1::ptr() };
+    let dma_channel = 2;
+
+    info!(
+        "[Debug UART Monitor] Starting DMA Channel {} + USART1 RX monitoring",
+        dma_channel
+    );
+
+    loop {
+        let is_busy = (dma0.busy0().read().bsy().bits() & (1 << dma_channel)) != 0;
+        let is_active = (dma0.active0().read().act().bits() & (1 << dma_channel)) != 0;
+        let is_enabled = (dma0.enableset0().read().ena().bits() & (1 << dma_channel)) != 0;
+        let xfercount = dma0.channel(dma_channel).xfercfg().read().xfercount().bits();
+
+        let uart_fifostat = usart1.fifostat().read();
+        let dmarx = usart1.fifocfg().read().dmarx().bit();
+        let rxfull = uart_fifostat.rxfull().bit();
+        let rxlvl = uart_fifostat.rxlvl().bits();
+        let rxerr = uart_fifostat.rxerr().bit();
+        let rxnoempty = uart_fifostat.rxnotempty().bit();
+        let rxidle = usart1.stat().read().rxidle().bit();
+
+        info!(
+            "[Debug UART Monitor] DMA CH {}: Busy: {}, Active: {}, Enabled: {}, XferCount: {} | USART1 RX: DMARX: {}, RXFULL: {}, RXLVL: {}, RXERR: {}, NotEmpty: {}, IDLE: {}",
+            dma_channel, is_busy, is_active, is_enabled, xfercount, dmarx, rxfull, rxlvl, rxerr, rxnoempty, rxidle
+        );
+
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(interval_ms)).await;
+    }
 }
 
 #[cfg(feature = "rt")]
@@ -194,32 +210,39 @@ fn dma0_irq_handler<const N: usize>(wakers: &[AtomicWaker; N]) {
                 // SAFETY: unsafe due to .bits usage
                 reg.inta0().write(|w| unsafe { w.ia().bits(1 << channel) });
 
-                let ch_num = channel as usize;
-                // Update ping-pong state if applicable
-                if pp_is_registered(ch_num) {
-                    let current_desc = pp_get_dma_desc(ch_num);
+                // For continuous transfers, retrigger the transfer if there is a reload configured and there is free buffer descriptor
+                if reg.channel(channel as usize).xfercfg().read().reload().bit_is_set() {
+                    IRQ_CNT.fetch_add(1, Ordering::Relaxed);
+                    let ping_pong_status = unsafe { &mut PING_PONG_STATUS[channel as usize] };
 
-                    // Mark completed descriptor's buffer as having data
-                    if current_desc == 0 {
-                        pp_set_buf_a_has_data(ch_num);
-                    } else {
-                        pp_set_buf_b_has_data(ch_num);
-                    }
+                    if ping_pong_status.current == PingPongSelector::BufferA {
+                        // Just finished Buffer A, switching to Buffer B
+                        ping_pong_status.buffer_a_status = BufferConsumeStatus::Granted;
+                        ping_pong_status.current = PingPongSelector::BufferB;
 
-                    // The descriptor need to be switched before the next transfer
-                    let next_desc = pp_switch_dma_desc(ch_num);
-                    // Check if the next descriptor still has data not yet consumed
-                    let next_has_data = if next_desc == 0 {
-                        pp_buf_a_has_data(ch_num)
+                        if ping_pong_status.buffer_b_status == BufferConsumeStatus::Granted {
+                            OVERRUN_CNT.fetch_add(1, Ordering::Relaxed);
+                            error!("DMA Ping-Pong buffer overrun on channel {}!", channel);
+                        } else {
+                            SWTRIG_CNT.fetch_add(1, Ordering::Relaxed);
+                            reg.channel(channel as usize)
+                                .xfercfg()
+                                .modify(|_, w| w.swtrig().set_bit());
+                        }
                     } else {
-                        pp_buf_b_has_data(ch_num)
-                    };
+                        // Just finished Buffer B, switching to Buffer A
+                        ping_pong_status.buffer_b_status = BufferConsumeStatus::Granted;
+                        ping_pong_status.current = PingPongSelector::BufferA;
 
-                    // If the next descriptor still has data, we should not retrigger the DMA transfer
-                    if next_has_data {
-                        pp_set_dma_waiting(ch_num);
-                    } else {
-                        reg.channel(ch_num).xfercfg().modify(|_, w| w.swtrig().set_bit());
+                        if ping_pong_status.buffer_a_status == BufferConsumeStatus::Granted {
+                            OVERRUN_CNT.fetch_add(1, Ordering::Relaxed);
+                            error!("DMA Ping-Pong buffer overrun on channel {}!", channel);
+                        } else {
+                            SWTRIG_CNT.fetch_add(1, Ordering::Relaxed);
+                            reg.channel(channel as usize)
+                                .xfercfg()
+                                .modify(|_, w| w.swtrig().set_bit());
+                        }
                     }
                 }
 
@@ -363,37 +386,5 @@ impl Instance for NoDma {
 impl SealedInstance for NoDma {
     fn info() -> Option<DmaInfo> {
         None
-    }
-}
-
-pub async fn monitor_dma_uart_combined(dma_channel: usize, interval_ms: u64) {
-    let dma0 = unsafe { crate::pac::Dma0::steal() };
-    let usart4 = unsafe { &*crate::pac::Usart4::ptr() };
-
-    info!(
-        "[Debug UART Monitor] Starting DMA Channel {} + USART4 RX monitoring",
-        dma_channel
-    );
-
-    loop {
-        let is_busy = (dma0.busy0().read().bsy().bits() & (1 << dma_channel)) != 0;
-        let is_active = (dma0.active0().read().act().bits() & (1 << dma_channel)) != 0;
-        let is_enabled = (dma0.enableset0().read().ena().bits() & (1 << dma_channel)) != 0;
-        let xfercount = dma0.channel(dma_channel).xfercfg().read().xfercount().bits();
-
-        let uart_fifostat = usart4.fifostat().read();
-        let dmarx = usart4.fifocfg().read().dmarx().bit();
-        let rxfull = uart_fifostat.rxfull().bit();
-        let rxlvl = uart_fifostat.rxlvl().bits();
-        let rxerr = uart_fifostat.rxerr().bit();
-        let rxnoempty = uart_fifostat.rxnotempty().bit();
-        let rxidle = usart4.stat().read().rxidle().bit();
-
-        info!(
-            "[Debug UART Monitor] DMA CH {}: Busy: {}, Active: {}, Enabled: {}, XferCount: {} | USART4 RX: DMARX: {}, RXFULL: {}, RXLVL: {}, RXERR: {}, NotEmpty: {}, IDLE: {}",
-            dma_channel, is_busy, is_active, is_enabled, xfercount, dmarx, rxfull, rxlvl, rxerr, rxnoempty, rxidle
-        );
-
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(interval_ms)).await;
     }
 }
