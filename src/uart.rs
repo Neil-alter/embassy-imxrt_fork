@@ -228,6 +228,8 @@ struct BufferConfig {
     #[cfg(feature = "time")]
     read_off: usize,
     #[cfg(feature = "time")]
+    pre_read_off: usize,
+    #[cfg(feature = "time")]
     polling_rate: u64,
     #[cfg(feature = "time")]
     consumer_buf: dma::PingPongSelector,
@@ -760,6 +762,7 @@ impl<'a> UartRx<'a, Async> {
                 read_off: 0,
                 polling_rate: polling_rate_us,
                 consumer_buf: dma::PingPongSelector::BufferA,
+                pre_read_off: 0,
             }),
         ))
     }
@@ -875,9 +878,11 @@ impl<'a> UartRx<'a, Async> {
         }
 
         let half_size = buffer_config.buffer_a.len();
-
         // Total bytes read into user buffer
         let mut bytes_read = 0;
+
+        // Need to wait for new data or not
+        let mut poll_timeout_counter = 0;
 
         // As the Rx Idle interrupt is not present for this processor, we must poll to see if new data is available
         while bytes_read < buf.len() {
@@ -957,6 +962,9 @@ impl<'a> UartRx<'a, Async> {
                 bytes_read += to_read;
                 buffer_config.read_off += to_read;
 
+                // Update pre_read_off to current position after reading data
+                buffer_config.pre_read_off = buffer_config.read_off;
+
                 // The whole half buffer has been read, switch to next buffer
                 if buffer_config.read_off == half_size {
                     buffer_config.read_off = 0;
@@ -967,14 +975,38 @@ impl<'a> UartRx<'a, Async> {
                         dma::PingPongSelector::BufferB => dma::PingPongSelector::BufferA,
                     };
                 }
+
+                if rx_dma.get_channel_number() == 2 {
+                    info!("available");
+                    info!("buf_f: {:?}", buf);
+                }
             } else {
-                // No data available, wait for new data to arrive or error condition
-                let res = select(
-                    embassy_time::Timer::after_micros(buffer_config.polling_rate),
-                    // detect bus errors
-                    poll_fn(|cx| {
+                // No new data available in current buffer
+                // Check if read position has changed since last check
+                if buffer_config.read_off == buffer_config.pre_read_off {
+                    // No progress made since last check, increment timeout counter
+                    poll_timeout_counter += 1;
+                    if rx_dma.get_channel_number() == 2 {
+                        info!("No available {}", poll_timeout_counter);
+                    }
+                } else {
+                    // Progress was made, reset timeout counter and update pre_read_off
+                    poll_timeout_counter = 0;
+                    buffer_config.pre_read_off = buffer_config.read_off;
+                    if rx_dma.get_channel_number() == 2 {
+                        info!("No available but reset {}", poll_timeout_counter);
+                    }
+                }
+
+                // If timeout counter exceeds threshold, wait for new data or error to avoid busy-waiting
+                if poll_timeout_counter >= 3 {
+                    if rx_dma.get_channel_number() == 2 {
+                        info!("Timeout reached, wait for new data or error");
+                    }
+                    let res = poll_fn(|cx| {
                         self.info.waker.register(cx.waker());
 
+                        // Enable interrupts for error detection and start bit
                         self.info.regs.intenset().write(|w| {
                             w.framerren()
                                 .set_bit()
@@ -984,8 +1016,11 @@ impl<'a> UartRx<'a, Async> {
                                 .set_bit()
                                 .aberren()
                                 .set_bit()
+                                .starten()
+                                .set_bit()
                         });
 
+                        // Read status first, then clear specific interrupts
                         let stat = self.info.regs.stat().read();
 
                         self.info.regs.stat().write(|w| {
@@ -997,6 +1032,8 @@ impl<'a> UartRx<'a, Async> {
                                 .clear_bit_by_one()
                                 .aberr()
                                 .clear_bit_by_one()
+                                .start()
+                                .clear_bit_by_one()
                         });
 
                         if stat.framerrint().bit_is_set() {
@@ -1007,16 +1044,80 @@ impl<'a> UartRx<'a, Async> {
                             Poll::Ready(Err(Error::Noise))
                         } else if stat.aberr().bit_is_set() {
                             Poll::Ready(Err(Error::Fail))
+                        } else if stat.start().bit_is_set() {
+                            // New data has started arriving
+                            Poll::Ready(Ok(()))
                         } else {
                             Poll::Pending
                         }
-                    }),
-                )
-                .await;
+                    })
+                    .await;
 
-                match res {
-                    Either::First(()) | Either::Second(Ok(())) => (),
-                    Either::Second(Err(e)) => return Err(e),
+                    match res {
+                        Ok(()) => {
+                            // Start bit detected, reset timeout counter and continue polling
+                            if rx_dma.get_channel_number() == 2 {
+                                info!("Start bit detected, reset timeout counter and continue polling");
+                            }
+                            poll_timeout_counter = 0;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    if rx_dma.get_channel_number() == 2 {
+                        info!("Polling wait");
+                    }
+                    // Continue polling with timer, wait for polling interval
+                    let res = select(
+                        embassy_time::Timer::after_micros(buffer_config.polling_rate),
+                        // detect bus errors
+                        poll_fn(|cx| {
+                            self.info.waker.register(cx.waker());
+
+                            self.info.regs.intenset().write(|w| {
+                                w.framerren()
+                                    .set_bit()
+                                    .parityerren()
+                                    .set_bit()
+                                    .rxnoiseen()
+                                    .set_bit()
+                                    .aberren()
+                                    .set_bit()
+                            });
+
+                            let stat = self.info.regs.stat().read();
+
+                            self.info.regs.stat().write(|w| {
+                                w.framerrint()
+                                    .clear_bit_by_one()
+                                    .parityerrint()
+                                    .clear_bit_by_one()
+                                    .rxnoiseint()
+                                    .clear_bit_by_one()
+                                    .aberr()
+                                    .clear_bit_by_one()
+                            });
+
+                            if stat.framerrint().bit_is_set() {
+                                Poll::Ready(Err(Error::Framing))
+                            } else if stat.parityerrint().bit_is_set() {
+                                Poll::Ready(Err(Error::Parity))
+                            } else if stat.rxnoiseint().bit_is_set() {
+                                Poll::Ready(Err(Error::Noise))
+                            } else if stat.aberr().bit_is_set() {
+                                Poll::Ready(Err(Error::Fail))
+                            } else {
+                                Poll::Pending
+                            }
+                        }),
+                    )
+                    .await;
+
+                    match res {
+                        Either::First(()) | Either::Second(Ok(())) => (),
+                        Either::Second(Err(e)) => return Err(e),
+                    }
                 }
             }
         }
@@ -1078,6 +1179,9 @@ impl<'a> Uart<'a, Async> {
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma: Channel<'_> = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
 
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
         let flexcomm = Self::init::<T>(Some(tx.into()), Some(rx.into()), None, None, config)?;
 
         if !buffer.len().is_multiple_of(2) {
@@ -1113,6 +1217,7 @@ impl<'a> Uart<'a, Async> {
                     read_off: 0,
                     polling_rate: polling_rate_us,
                     consumer_buf: dma::PingPongSelector::BufferA,
+                    pre_read_off: 0,
                 }),
             ),
         })
@@ -1186,6 +1291,9 @@ impl<'a> Uart<'a, Async> {
         let tx_dma = dma::Dma::reserve_channel(tx_dma);
         let rx_dma = dma::Dma::reserve_channel(rx_dma).ok_or(Error::Fail)?;
 
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
         let flexcomm = Self::init::<T>(
             Some(tx.into()),
             Some(rx.into()),
@@ -1227,6 +1335,7 @@ impl<'a> Uart<'a, Async> {
                     read_off: 0,
                     polling_rate: polling_rate_us,
                     consumer_buf: dma::PingPongSelector::BufferA,
+                    pre_read_off: 0,
                 }),
             ),
         })
@@ -1510,12 +1619,32 @@ pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
 }
 
+use crate::gpio::Level as GpioLevel;
+fn set_debug_gpio(level: GpioLevel) {
+    unsafe {
+        use crate::gpio::{DriveMode, DriveStrength, Flex, SenseEnabled, SlewRate};
+
+        let p = crate::Peripherals::steal();
+        let mut debug_gpio = Flex::<SenseEnabled>::new(p.PIO3_31);
+        debug_gpio.set_as_output(DriveMode::PushPull, DriveStrength::Normal, SlewRate::Standard);
+        debug_gpio.set_level(level);
+    }
+}
+
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let regs = T::info().regs;
         let stat = regs.intstat().read();
 
+        if stat.start().bit_is_set() {
+            if core::any::TypeId::of::<T>() == core::any::TypeId::of::<crate::peripherals::FLEXCOMM1>() {
+                set_debug_gpio(GpioLevel::Low);
+                set_debug_gpio(GpioLevel::High);
+            }
+        }
+
         if stat.txidle().bit_is_set()
+            || stat.start().bit_is_set()
             || stat.framerrint().bit_is_set()
             || stat.parityerrint().bit_is_set()
             || stat.rxnoiseint().bit_is_set()
@@ -1523,6 +1652,8 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         {
             regs.intenclr().write(|w| {
                 w.txidleclr()
+                    .set_bit()
+                    .startclr()
                     .set_bit()
                     .framerrclr()
                     .set_bit()
